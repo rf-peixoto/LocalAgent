@@ -3,7 +3,7 @@
 A browser interface for LM Studio's native `POST /api/v1/chat` endpoint, with a neon cyberpunk look.
 
 ```
-your browser  ──►  Flask (app.py, any machine)  ──►  LM Studio (192.168.1.228:1234)
+your browser  ──►  Flask (app.py, any machine)  ──►  LM Studio (Your local IP:1234)
 ```
 
 Flask serves the page and relays each message to LM Studio, so you can chat from any device on your network. The API token stays in `config.json` on the Flask machine and is never sent to the browser.
@@ -21,7 +21,7 @@ Then open `http://<ip-of-the-machine-running-app.py>:5000` in any browser on you
 
 In ⚙ Settings → **Connection to LM Studio**:
 
-- **Server URL**: `192.168.1.228:1234` is enough; the `/api/v1/chat` path is added for you.
+- **Server URL**: `Your local IP:1234` is enough; the `/api/v1/chat` path is added for you.
 - **API token**: the token LM Studio asks for when its "Require authentication" option is on. Leave the field blank to keep the current token, or tick **No token** if authentication is off.
 - **Test connection** checks the settings before you save them, and tells you if the server can't be reached or rejects the token.
 
