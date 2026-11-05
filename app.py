@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Web chat client for LM Studio's native /api/v1/chat endpoint.
+"""LOCAL//GRID — web chat client for LM Studio's native /api/v1/chat endpoint.
 
-Flask serves a single-page UI and relays requests to LM Studio, so any browser
-on the local network can chat with the model. The API token never leaves this
-server. Conversations are stored in each browser (IndexedDB), so every machine
-sees only the chats that were started on it.
+Flask serves a single-page UI (behind a password) and relays requests to LM Studio,
+so any browser on the local network can chat with the model. The API token never
+leaves this server. Conversations are stored in each browser (IndexedDB), so every
+machine sees only the chats that were started on it.
 """
 import argparse
 import base64
+import getpass
 import io
 import json
-import mimetypes
 import os
 import re
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -22,94 +23,73 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # find auth/voice/... however app.py is launched
+import auth  # noqa: E402
+from textfix import decode_text_file, fix_mojibake  # noqa: E402
+from voice import KokoroTTS, WhisperSTT  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent
 IMAGE_MIMES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".webp": "image/webp", ".gif": "image/gif"}
+REASONING_LEVELS = ("off", "low", "medium", "high", "on")
+TOOL_OUTPUT_LIMIT = 20000
 
 app = Flask(__name__)
 CFG = {}
 CONFIG_PATH = ROOT / "config.json"
-
-
-# --------------------------------------------------------------------------- text encoding
-
-# Each character that a single byte 0x80-0xFF becomes when UTF-8 bytes are wrongly
-# decoded as Latin-1 or Windows-1252 ("mojibake": "NÃ£o" instead of "Não").
-_BYTE_OF = {}
-for _b in range(0x80, 0x100):
-    _BYTE_OF[chr(_b)] = _b
-    try:
-        _BYTE_OF[bytes([_b]).decode("cp1252")] = _b
-    except UnicodeDecodeError:
-        pass
-_MOJI_HINT = re.compile("[Â-ô][\u0080-¿ŒœŠšŸŽžƒ"
-                        "ˆ˜–—‘-‚“-„†-•…‰"
-                        "‹›€™]")
-# Only accept repairs that produce characters a real text plausibly contains, so that
-# genuine text such as "Até…”" is never "repaired" into a CJK character. (U+0080-U+009F
-# is the middle step of doubly broken text; the next pass turns it into the real char.)
-_PLAUSIBLE = ((0x0080, 0x017F), (0x0300, 0x036F), (0x0370, 0x03FF), (0x0400, 0x04FF),
-              (0x1E00, 0x1EFF), (0x2000, 0x206F), (0x20A0, 0x20CF), (0x2100, 0x27BF), (0x2900, 0x2BFF),
-              (0xFE00, 0xFE0F), (0x1F000, 0x1FAFF))
-
-
-def _utf8_len(lead):
-    return 2 if 0xC2 <= lead <= 0xDF else 3 if 0xE0 <= lead <= 0xEF else 4 if 0xF0 <= lead <= 0xF4 else 0
-
-
-def fix_mojibake(text):
-    """Repair UTF-8 text that was decoded with the wrong codec (also when doubly broken)."""
-    if not isinstance(text, str) or not _MOJI_HINT.search(text):
-        return text
-    # Windows-1252 has no character for byte 0x9D, so a broken "”" often arrives as "â€�".
-    text = text.replace("\u00e2\u20ac\ufffd", "\u201d")
-    for _ in range(3):
-        out, i, n, changed = [], 0, len(text), False
-        while i < n:
-            lead = _BYTE_OF.get(text[i])
-            size = _utf8_len(lead) if lead is not None else 0
-            if size and i + size <= n:
-                seq = [lead]
-                for ch in text[i + 1:i + size]:
-                    b = _BYTE_OF.get(ch)
-                    if b is None or not 0x80 <= b <= 0xBF:
-                        break
-                    seq.append(b)
-                if len(seq) == size:
-                    try:
-                        decoded = bytes(seq).decode("utf-8")
-                    except UnicodeDecodeError:
-                        decoded = None
-                    if decoded and any(lo <= ord(decoded) <= hi for lo, hi in _PLAUSIBLE):
-                        out.append(decoded)
-                        i += size
-                        changed = True
-                        continue
-            out.append(text[i])
-            i += 1
-        if not changed:
-            break
-        text = "".join(out)
-    return text
-
-
-def decode_text_file(raw):
-    """Decode an uploaded text file: UTF-8, UTF-16 (BOM) or Windows-1252. Returns (text, encoding)."""
-    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16"), "UTF-16"
-    if b"\x00" in raw:
-        raise ValueError("binary files are unsupported. Send text/source files, PDFs or images.")
-    try:
-        return raw.decode("utf-8-sig"), "UTF-8"
-    except UnicodeDecodeError:
-        pass
-    try:
-        return raw.decode("cp1252"), "Windows-1252"
-    except UnicodeDecodeError:
-        return raw.decode("latin-1"), "Latin-1"
+TTS = KokoroTTS({"enabled": False})
+STT = WhisperSTT({"enabled": False})
+_config_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------- config
+
+def _num(value, lo=None, hi=None, integer=False):
+    if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+        return False
+    return (lo is None or value >= lo) and (hi is None or value <= hi)
+
+
+def _check_persona(p, label):
+    t = p.get("temperature")
+    if t is not None and not _num(t, 0, 1):
+        raise ValueError(f"{label}: temperature must be null or 0-1")
+    r = p.get("reasoning")
+    if r is not None and r not in REASONING_LEVELS:
+        raise ValueError(f"{label}: reasoning must be null or one of {', '.join(REASONING_LEVELS)}")
+    m = p.get("model")
+    if m is not None and (not isinstance(m, str) or not m.strip()):
+        raise ValueError(f"{label}: model must be null or a model key")
+    tools = p.get("tools")
+    if tools is not None and (not isinstance(tools, list) or not all(isinstance(x, str) for x in tools)):
+        raise ValueError(f"{label}: tools must be a list of integration names")
+    return {"temperature": t, "reasoning": r, "model": m.strip() if m else None, "tools": tools or []}
+
+
+def _check_integration(item, i):
+    if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"].strip():
+        raise ValueError(f"integrations[{i}] needs a 'name'")
+    allowed = item.get("allowed_tools")
+    if allowed is not None and (not isinstance(allowed, list) or not all(isinstance(x, str) for x in allowed)):
+        raise ValueError(f"integrations[{i}].allowed_tools must be a list of tool names")
+    if isinstance(item.get("id"), str) and item["id"].strip():
+        spec = {"type": "plugin", "id": item["id"].strip()}
+    elif isinstance(item.get("server_url"), str) and item["server_url"].startswith(("http://", "https://")):
+        spec = {"type": "ephemeral_mcp", "server_label": str(item.get("server_label") or item["name"]).strip(),
+                "server_url": item["server_url"]}
+        headers = item.get("headers")
+        if headers is not None:
+            if not isinstance(headers, dict) or not all(isinstance(v, str) for v in headers.values()):
+                raise ValueError(f"integrations[{i}].headers must map names to strings")
+            spec["headers"] = headers
+    else:
+        raise ValueError(f"integrations[{i}] needs 'id' (an mcp.json plugin such as \"mcp/playwright\") "
+                         "or 'server_url' (an MCP server URL)")
+    if allowed:
+        spec["allowed_tools"] = allowed
+    return {"name": item["name"].strip(), "default": bool(item.get("default")),
+            "description": str(item.get("description") or ""), "spec": spec}
+
 
 def load_config(path):
     with path.open(encoding="utf-8") as f:
@@ -123,45 +103,73 @@ def load_config(path):
         value = cfg.get(key)
         if value is None and key == "response_timeout":
             continue  # Disable idle timeout; not a guarantee against server disconnects.
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        if not _num(value) or value <= 0:
             raise ValueError(f"{key} must be > 0 (or null for response_timeout)")
     for key, default in (("max_file_bytes", 524288), ("max_image_bytes", 10 * 1024 * 1024),
-                         ("max_pdf_bytes", 20 * 1024 * 1024), ("port", 5000)):
+                         ("max_pdf_bytes", 20 * 1024 * 1024), ("max_audio_bytes", 25 * 1024 * 1024), ("port", 5000)):
         value = cfg.get(key, default)
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        if not _num(value, 1, integer=True):
             raise ValueError(f"{key} must be a positive integer")
         cfg[key] = value
     temp = cfg.get("temperature")
-    if temp is not None and (isinstance(temp, bool) or not isinstance(temp, (int, float)) or not 0 <= temp <= 1):
+    if temp is not None and not _num(temp, 0, 1):
         raise ValueError("temperature must be null or a number between 0 and 1")
     max_out = cfg.get("max_output_tokens")
-    if max_out is not None and (isinstance(max_out, bool) or not isinstance(max_out, int) or max_out <= 0):
+    if max_out is not None and not _num(max_out, 1, integer=True):
         raise ValueError("max_output_tokens must be null or a positive integer")
+
+    integrations = cfg.get("integrations") or []
+    if not isinstance(integrations, list):
+        raise ValueError("integrations must be a list")
+    cfg["integrations"] = [_check_integration(x, i) for i, x in enumerate(integrations)]
+    names = {x["name"] for x in cfg["integrations"]}
+
     personas = cfg.get("personas", [])
     if not isinstance(personas, list):
         raise ValueError("personas must be a list")
-    clean = [{"name": "Default", "system_prompt": cfg["system_prompt"], "temperature": temp}]
+    default = {"name": "Default", "system_prompt": cfg["system_prompt"],
+               **_check_persona({"temperature": temp, "reasoning": cfg.get("reasoning"),
+                                 "model": None, "tools": cfg.get("default_tools")}, "default")}
+    clean = [default]
     for p in personas:
         if not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"].strip() \
                 or not isinstance(p.get("system_prompt"), str) or not p["system_prompt"].strip():
             raise ValueError("each persona needs a nonempty 'name' and 'system_prompt'")
-        t = p.get("temperature")
-        if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 <= t <= 1):
-            raise ValueError(f"persona {p['name']!r}: temperature must be null or 0-1")
+        extra = _check_persona(p, f"persona {p['name']!r}")
+        unknown = [t for t in extra["tools"] if t not in names]
+        if unknown:
+            raise ValueError(f"persona {p['name']!r} uses unknown integrations: {', '.join(unknown)}")
         clean = [c for c in clean if c["name"] != p["name"].strip()]
-        clean.append({"name": p["name"].strip(), "system_prompt": p["system_prompt"], "temperature": t})
+        clean.append({"name": p["name"].strip(), "system_prompt": p["system_prompt"], **extra})
     cfg["personas"] = clean
+
     cfg.setdefault("host", "0.0.0.0")
     cfg.setdefault("markdown", True)
     cfg.setdefault("show_stats", False)
     cfg.setdefault("show_reasoning", True)
     cfg.setdefault("fix_encoding", True)
+    cfg.setdefault("https", False)
     token = cfg.get("token")
     if token is not None and not isinstance(token, str):
         raise ValueError("token must be a string or null")
     cfg["token_from_env"] = "LM_API_TOKEN" in os.environ
     cfg["token"] = os.environ.get("LM_API_TOKEN", token or "")
+    if cfg.get("password_hash") is not None and not isinstance(cfg["password_hash"], str):
+        raise ValueError("password_hash must be a string or null (use --set-password)")
     return cfg
+
+
+def save_config(**changes):
+    """Update only the given keys in config.json, keeping every other key."""
+    with _config_lock:
+        with CONFIG_PATH.open(encoding="utf-8") as f:
+            data = json.load(f)
+        data.update(changes)
+        tmp = CONFIG_PATH.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, CONFIG_PATH)
 
 
 def models_url(chat_url):
@@ -186,19 +194,6 @@ def token_hint(token):
     return "••••" + token[-4:] if len(token) >= 8 else "•" * len(token)
 
 
-def save_connection_to_file(url, token):
-    """Update only url/token in config.json, keeping every other key and the file's layout."""
-    with CONFIG_PATH.open(encoding="utf-8") as f:
-        data = json.load(f)
-    data["url"] = url
-    data["token"] = token
-    tmp = CONFIG_PATH.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, CONFIG_PATH)
-
-
 def check_url(url):
     if not isinstance(url, str) or not url.strip():
         raise ValueError("The LM Studio URL can't be empty.")
@@ -207,7 +202,7 @@ def check_url(url):
         url = "http://" + url
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise ValueError("The LM Studio URL must look like http://192.168.1.228:1234")
+        raise ValueError("The LM Studio URL must look like http://<lmstudio-host>:1234")
     if parts.path in ("", "/"):  # just host:port given -> add the chat endpoint
         url = urlunsplit((parts.scheme, parts.netloc, "/api/v1/chat", "", ""))
     return url
@@ -228,6 +223,10 @@ def probe(url, token):
     except (ValueError, AttributeError):
         return False, "The server answered, but not like LM Studio's /api/v1/models."
     return True, f"Connected · {count} model{'s' if count != 1 else ''} available."
+
+
+def repair(text):
+    return fix_mojibake(text) if CFG.get("fix_encoding", True) else text
 
 
 # --------------------------------------------------------------------------- files
@@ -257,9 +256,7 @@ def read_upload(name, raw):
         content, encoding = decode_text_file(raw)
     except ValueError as exc:
         raise ValueError(f"{name}: {exc}") from exc
-    if CFG.get("fix_encoding", True):
-        content = fix_mojibake(content)
-    return {"name": name, "kind": "text", "size": size, "content": content, "encoding": encoding}
+    return {"name": name, "kind": "text", "size": size, "content": repair(content), "encoding": encoding}
 
 
 def extract_pdf_text(name, raw):
@@ -285,8 +282,7 @@ def extract_pdf_text(name, raw):
         raise ValueError(f"{name}: could not read PDF ({exc})") from exc
     if not pages:
         raise ValueError(f"{name}: no extractable text (scanned PDF?). OCR it first or send page images.")
-    text = "\n\n".join(pages)
-    return fix_mojibake(text) if CFG.get("fix_encoding", True) else text
+    return repair("\n\n".join(pages))
 
 
 def compose_input(message, attachments):
@@ -344,24 +340,45 @@ def iter_sse(response):
         yield event_name, "\n".join(data_lines)
 
 
-def repair(text):
-    return fix_mojibake(text) if CFG.get("fix_encoding", True) else text
+def _items(result, kind):
+    return [i for i in result.get("output", []) if isinstance(i, dict) and i.get("type") == kind]
 
 
 def extract_answer(result):
-    return "\n\n".join(
-        item["content"] for item in result.get("output", [])
-        if isinstance(item, dict) and item.get("type") == "message"
-        and isinstance(item.get("content"), str)
-    ).strip()
+    return "\n\n".join(i["content"] for i in _items(result, "message") if isinstance(i.get("content"), str)).strip()
 
 
 def extract_reasoning(result):
-    return "\n\n".join(
-        item["content"] for item in result.get("output", [])
-        if isinstance(item, dict) and item.get("type") == "reasoning"
-        and isinstance(item.get("content"), str)
-    ).strip()
+    return "\n\n".join(i["content"] for i in _items(result, "reasoning") if isinstance(i.get("content"), str)).strip()
+
+
+def _clip(value):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+    text = repair(text)
+    return text if len(text) <= TOOL_OUTPUT_LIMIT else text[:TOOL_OUTPUT_LIMIT] + f"\n… [{len(text):,} chars, truncated]"
+
+
+def _provider(info):
+    if not isinstance(info, dict):
+        return ""
+    return info.get("plugin_id") or info.get("server_label") or ""
+
+
+def extract_tools(result):
+    tools = []
+    for item in result.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "tool_call":
+            tools.append({"tool": item.get("tool"), "provider": _provider(item.get("provider_info")),
+                          "arguments": _clip(item.get("arguments", {})), "output": _clip(item.get("output", "")),
+                          "ok": True})
+        elif item.get("type") == "invalid_tool_call":
+            meta = item.get("metadata") or {}
+            tools.append({"tool": meta.get("tool_name"), "provider": _provider(meta.get("provider_info")),
+                          "arguments": _clip(meta.get("arguments", {})), "output": repair(str(item.get("reason", ""))),
+                          "ok": False})
+    return tools
 
 
 def ndjson(obj):
@@ -424,8 +441,19 @@ def relay_chat(payload, used_previous_id):
                     yield ndjson({"type": "status", "text": "Thinking…"})
                 elif event == "message.start":
                     yield ndjson({"type": "status", "text": "Writing…"})
-                elif event in ("tool_call.start", "tool_call.success", "tool_call.failure"):
-                    yield ndjson({"type": "status", "text": f"Tool: {data.get('tool') or event}"})
+                elif event == "tool_call.start":
+                    yield ndjson({"type": "tool", "phase": "start", "tool": data.get("tool"),
+                                  "provider": _provider(data.get("provider_info"))})
+                elif event == "tool_call.arguments":
+                    yield ndjson({"type": "tool", "phase": "arguments", "tool": data.get("tool"),
+                                  "arguments": _clip(data.get("arguments", {}))})
+                elif event == "tool_call.success":
+                    yield ndjson({"type": "tool", "phase": "success", "tool": data.get("tool"),
+                                  "arguments": _clip(data.get("arguments", {})), "output": _clip(data.get("output", ""))})
+                elif event == "tool_call.failure":
+                    meta = data.get("metadata") or {}
+                    yield ndjson({"type": "tool", "phase": "failure", "tool": meta.get("tool_name") or data.get("tool"),
+                                  "output": repair(str(data.get("reason", "")))})
                 elif event == "error":
                     err = data.get("error") or data
                     message = err.get("message", str(err)) if isinstance(err, dict) else str(err)
@@ -439,7 +467,7 @@ def relay_chat(payload, used_previous_id):
                       "Server state is uncertain; message not automatically retried."})
         return
     except requests.ConnectionError as exc:
-        yield ndjson({"type": "fatal", "message": f"Cannot reach LM Studio at {CFG['url']}: {exc}"})
+        yield ndjson({"type": "fatal", "message": f"Cannot reach LM Studio at {urlsplit(CFG['url']).netloc}: {exc}"})
         return
     except requests.RequestException as exc:
         yield ndjson({"type": "fatal", "message": f"Request failed: {exc}"})
@@ -464,10 +492,29 @@ def relay_chat(payload, used_previous_id):
         "type": "end",
         "answer": answer,
         "reasoning": repair(extract_reasoning(final)),
+        "tools": extract_tools(final),
         "response_id": new_id if isinstance(new_id, str) and new_id.startswith("resp_") else None,
         "stats": {**stats, "elapsed_seconds": round(time.monotonic() - started, 2)},
         "model_instance_id": final.get("model_instance_id"),
     })
+
+
+# --------------------------------------------------------------------------- security headers
+
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Permissions-Policy", "microphone=(self), camera=(), geolocation=()")
+    # Everything is served from this server: no third-party scripts, fonts or styles.
+    resp.headers.setdefault("Content-Security-Policy",
+                            "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
+                            "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; "
+                            "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+    if request.path.startswith("/api/"):
+        resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
 
 
 # --------------------------------------------------------------------------- routes
@@ -479,7 +526,7 @@ def index():
 
 @app.get("/api/config")
 def public_config():
-    """Everything the UI needs, except the token."""
+    """Everything the UI needs — never the token, password hash or integration headers."""
     parts = urlsplit(CFG["url"])
     return jsonify({
         "server": parts.netloc,
@@ -493,12 +540,17 @@ def public_config():
         "fix_encoding": bool(CFG["fix_encoding"]),
         "max_output_tokens": CFG.get("max_output_tokens"),
         "personas": CFG["personas"],
+        "integrations": [{"name": x["name"], "default": x["default"], "description": x["description"],
+                          "kind": x["spec"]["type"]} for x in CFG["integrations"]],
         "token_set": bool(CFG["token"]),
         "token_hint": token_hint(CFG["token"]),
         "token_from_env": CFG["token_from_env"],
         "max_file_bytes": CFG["max_file_bytes"],
         "max_image_bytes": CFG["max_image_bytes"],
         "max_pdf_bytes": CFG["max_pdf_bytes"],
+        "tts": TTS.status(),
+        "stt": STT.status(),
+        "https": bool(CFG.get("_https_active")),
     })
 
 
@@ -524,13 +576,18 @@ def list_models():
         if not isinstance(m, dict) or m.get("type") != "llm" or not m.get("key"):
             continue
         caps = m.get("capabilities") or {}
+        reasoning = caps.get("reasoning") if isinstance(caps.get("reasoning"), dict) else {}
+        options = [o for o in reasoning.get("allowed_options") or [] if o in REASONING_LEVELS]
         models.append({
             "key": m["key"],
             "name": m.get("display_name") or m["key"],
             "loaded": bool(m.get("loaded_instances")),
             "vision": bool(caps.get("vision")),
+            "tools": bool(caps.get("trained_for_tool_use")),
             "params": m.get("params_string"),
             "context_length": context_length(m),
+            "reasoning_options": options,
+            "reasoning_default": reasoning.get("default") if reasoning.get("default") in REASONING_LEVELS else None,
         })
     models.sort(key=lambda m: (not m["loaded"], m["name"].lower()))
     return jsonify({"models": models})
@@ -560,8 +617,8 @@ def chat():
     if not message.strip() and not attachments:
         return jsonify({"error": "Empty message."}), 400
     model = body.get("model") if isinstance(body.get("model"), str) and body["model"].strip() else CFG["model"]
-    payload = {"model": model, "input": compose_input(message.strip(), attachments),
-               "store": True, "stream": True}
+    store = body.get("store") is not False
+    payload = {"model": model, "input": compose_input(message.strip(), attachments), "store": store, "stream": True}
     previous_id = body.get("previous_response_id")
     if isinstance(previous_id, str) and previous_id.startswith("resp_"):
         payload["previous_response_id"] = previous_id
@@ -571,11 +628,17 @@ def chat():
         payload["system_prompt"] = system_prompt if isinstance(system_prompt, str) and system_prompt.strip() \
             else CFG["system_prompt"]
     temperature = body.get("temperature", CFG.get("temperature"))
-    if isinstance(temperature, (int, float)) and not isinstance(temperature, bool) and 0 <= temperature <= 1:
+    if _num(temperature, 0, 1):
         payload["temperature"] = temperature
     max_out = body.get("max_output_tokens", CFG.get("max_output_tokens"))
-    if isinstance(max_out, int) and not isinstance(max_out, bool) and max_out > 0:
+    if _num(max_out, 1, integer=True):
         payload["max_output_tokens"] = max_out
+    if body.get("reasoning") in REASONING_LEVELS:
+        payload["reasoning"] = body["reasoning"]
+    wanted = body.get("tools") if isinstance(body.get("tools"), list) else []
+    specs = [x["spec"] for x in CFG["integrations"] if x["name"] in wanted]
+    if specs:
+        payload["integrations"] = specs
     return Response(stream_with_context(relay_chat(payload, previous_id)),
                     mimetype="application/x-ndjson; charset=utf-8",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -638,7 +701,7 @@ def update_connection():
     elif isinstance(body.get("token"), str) and body["token"].strip():
         token = body["token"].strip()
     try:
-        save_connection_to_file(url, token)
+        save_config(url=url, token=token)
     except (OSError, ValueError) as exc:
         return jsonify({"error": f"Could not write {CONFIG_PATH.name}: {exc}"}), 500
     CFG["url"], CFG["token"] = url, token
@@ -649,6 +712,41 @@ def update_connection():
                     "token_set": bool(token), "token_hint": token_hint(token), "note": note})
 
 
+@app.post("/api/tts")
+def tts():
+    if not TTS.available:
+        return jsonify({"error": TTS.error or "Kokoro TTS is not installed on the server."}), 501
+    body = request.get_json(silent=True) or {}
+    text = body.get("text") if isinstance(body.get("text"), str) else ""
+    text = text.strip()[:1200]
+    if not text:
+        return jsonify({"error": "No text."}), 400
+    voices = body.get("voices") if isinstance(body.get("voices"), dict) else None
+    try:
+        wav, lang, voice = TTS.synthesize(text, voices=voices, hint=body.get("hint") or "pt", speed=body.get("speed"))
+    except Exception as exc:
+        return jsonify({"error": f"TTS failed: {exc.__class__.__name__}: {exc}"}), 500
+    return Response(wav, mimetype="audio/wav", headers={"X-TTS-Lang": lang, "X-TTS-Voice": voice})
+
+
+@app.post("/api/stt")
+def stt():
+    if not STT.available:
+        return jsonify({"error": STT.error or "faster-whisper is not installed on the server."}), 501
+    f = request.files.get("audio")
+    if not f:
+        return jsonify({"error": "No audio received."}), 400
+    raw = f.read(CFG["max_audio_bytes"] + 1)
+    if len(raw) > CFG["max_audio_bytes"]:
+        return jsonify({"error": "Recording too long."}), 413
+    language = request.form.get("language") or None
+    try:
+        text, lang = STT.transcribe(raw, language=language)
+    except Exception as exc:
+        return jsonify({"error": f"Transcription failed: {exc.__class__.__name__}: {exc}"}), 500
+    return jsonify({"text": repair(text), "language": lang})
+
+
 @app.errorhandler(413)
 def too_large(_):
     return jsonify({"error": "Upload too large."}), 413
@@ -656,25 +754,97 @@ def too_large(_):
 
 # --------------------------------------------------------------------------- main
 
+def set_password_cli():
+    print("Set the password for the LOCAL//GRID web interface.")
+    while True:
+        p1 = getpass.getpass("New password: ")
+        if len(p1) < auth.MIN_PASSWORD:
+            print(f"Use at least {auth.MIN_PASSWORD} characters.")
+            continue
+        if getpass.getpass("Repeat it: ") != p1:
+            print("The two passwords differ, try again.")
+            continue
+        save_config(password_hash=auth.hash_password(p1))
+        print(f"Saved (as a scrypt hash) in {CONFIG_PATH.name}. All devices will need to log in again.")
+        return 0
+
+
+def serve(host, port, cert=None, key=None):
+    try:
+        from cheroot import wsgi
+    except ImportError:
+        print("cheroot is not installed; using Flask's development server (pip install cheroot).")
+        app.run(host=host, port=port, threaded=True, debug=False,
+                ssl_context=(str(cert), str(key)) if cert else None)
+        return
+    server = wsgi.Server((host, port), app, numthreads=24, server_name="localgrid", timeout=300)
+    if cert:
+        from cheroot.ssl.builtin import BuiltinSSLAdapter
+        server.ssl_adapter = BuiltinSSLAdapter(str(cert), str(key))
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        server.stop()
+
+
 def main():
-    global CFG, CONFIG_PATH
-    parser = argparse.ArgumentParser(description="LM Studio web chat")
+    global CFG, CONFIG_PATH, TTS, STT
+    parser = argparse.ArgumentParser(description="LOCAL//GRID — LM Studio web chat")
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     parser.add_argument("--host", help="override config host (default 0.0.0.0 = whole network)")
     parser.add_argument("--port", type=int, help="override config port")
+    parser.add_argument("--https", action="store_true", help="serve over HTTPS (needed for voice input)")
+    parser.add_argument("--set-password", action="store_true", help="set the login password and exit")
     args = parser.parse_args()
+    CONFIG_PATH = args.config.resolve()
+    example = ROOT / "config.example.json"
+    if not CONFIG_PATH.exists() and example.exists() and CONFIG_PATH.name == "config.json":
+        import shutil
+        shutil.copyfile(example, CONFIG_PATH)   # your settings, token and password hash live here (git-ignored)
+        print(f"Created {CONFIG_PATH.name} from config.example.json.")
+    if args.set_password:
+        return set_password_cli()
     try:
-        CONFIG_PATH = args.config.resolve()
         CFG = load_config(CONFIG_PATH)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
+
+    https = bool(args.https or CFG.get("https"))
+    cert = key = None
+    if https:
+        if CFG.get("ssl_cert") and CFG.get("ssl_key"):
+            cert, key = Path(CFG["ssl_cert"]).expanduser(), Path(CFG["ssl_key"]).expanduser()
+        else:
+            from certs import ensure_self_signed
+            try:
+                cert, key = ensure_self_signed(CONFIG_PATH.parent / "certs")
+            except RuntimeError as exc:
+                print(exc, file=sys.stderr)
+                return 1
+    CFG["_https_active"] = https
+
     app.config["MAX_CONTENT_LENGTH"] = max(CFG["max_pdf_bytes"], CFG["max_image_bytes"]) * 3 + 8 * 1024 * 1024
+    auth.init(app, CFG, save_config, CONFIG_PATH.parent / ".secret_key", https)
+
+    TTS = KokoroTTS(CFG.get("tts"))
+    STT = WhisperSTT(CFG.get("stt"))
+    for engine, label in ((TTS, "Kokoro TTS"), (STT, "faster-whisper")):
+        if engine.enabled and engine.installed:
+            print(f"{label}: loading in the background (the first run downloads the model).")
+            threading.Thread(target=engine.warm_up, daemon=True).start()
+        elif engine.enabled:
+            print(f"{label}: not installed — optional (see README).")
+
     host = args.host or CFG["host"]
     port = args.port or CFG["port"]
+    scheme = "https" if https else "http"
     print(f"LM Studio: {CFG['url']}  ·  model: {CFG['model']}")
-    print(f"Open http://<this-machine-ip>:{port} from any device on your network (Ctrl+C to stop).")
-    app.run(host=host, port=port, threaded=True, debug=False)
+    if not CFG.get("password_hash"):
+        print(f"No password yet: open {scheme}://localhost:{port} on THIS machine to create one, "
+              "or run: python app.py --set-password")
+    print(f"Open {scheme}://<this-machine-ip>:{port} from any device on your network (Ctrl+C to stop).")
+    serve(host, port, cert, key)
     return 0
 
 

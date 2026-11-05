@@ -27,7 +27,6 @@ let current = null;          // active conversation object
 let pending = [];            // queued attachments for the next message
 let busy = null;             // { controller } while generating
 let editing = null;          // { index } when editing/regenerating from a past message
-let speaking = null;         // button currently reading aloud
 
 const LANG_EXT = {
   python: ".py", py: ".py", javascript: ".js", js: ".js", jsx: ".jsx", typescript: ".ts", ts: ".ts", tsx: ".tsx",
@@ -197,6 +196,8 @@ function loadPrefs() {
     max_output_tokens: CONFIG.max_output_tokens, model: CONFIG.model,
     markdown: CONFIG.markdown, show_stats: CONFIG.show_stats, show_reasoning: CONFIG.show_reasoning,
     fix_encoding: CONFIG.fix_encoding, enter_sends: true, effects: true, font_size: "m", user_personas: [],
+    tts_engine: "kokoro", tts_speed: CONFIG.tts?.speed || 1, voice_pt: CONFIG.tts?.defaults?.pt || "pf_dora",
+    voice_en: CONFIG.tts?.defaults?.en || "af_heart", stt_lang: "",
   };
   try { PREFS = { ...defaults, ...JSON.parse(localStorage.getItem("llmchat-prefs") || "{}") }; }
   catch { PREFS = defaults; }
@@ -220,15 +221,19 @@ function allPersonas() {
  *  (so editing config.json takes effect); "Custom" uses the prompt saved in this browser. */
 function activePersona() {
   const list = allPersonas();
-  if (PREFS.persona === "Custom") return { name: "Custom", system_prompt: PREFS.system_prompt, temperature: PREFS.temperature };
+  if (PREFS.persona === "Custom") return { name: "Custom", system_prompt: PREFS.system_prompt, temperature: PREFS.temperature, tools: defaultTools() };
   return list.find(p => p.name === PREFS.persona) || list.find(p => p.name === "Default") || list[0];
 }
+
+function defaultTools() { return (CONFIG.integrations || []).filter(x => x.default).map(x => x.name); }
+function knownTools(list) { const names = new Set((CONFIG.integrations || []).map(x => x.name)); return (list || []).filter(n => names.has(n)); }
 
 function newConversation() {
   const p = activePersona();
   return { id: uid(), title: "New chat", created: Date.now(), updated: Date.now(), pinned: false, draft: "",
-    model: PREFS.model || CONFIG.model, persona: p.name, system_prompt: p.system_prompt,
+    model: p.model || PREFS.model || CONFIG.model, persona: p.name, system_prompt: p.system_prompt,
     temperature: p.temperature ?? null, max_output_tokens: PREFS.max_output_tokens,
+    reasoning: p.reasoning ?? null, tools: p.tools?.length ? knownTools(p.tools) : defaultTools(),
     previous_response_id: null, messages: [] };
 }
 
@@ -261,7 +266,7 @@ async function repairStoredChats() {
 /* ======================================================================= markdown rendering */
 marked.setOptions({ gfm: true, breaks: false });
 
-function renderMarkdownInto(node, text, { streaming = false } = {}) {
+function renderMarkdownInto(node, text, { streaming = false, startIndex = 1 } = {}) {
   if (!PREFS.markdown) {
     node.classList.add("plain");
     node.textContent = text;
@@ -270,7 +275,7 @@ function renderMarkdownInto(node, text, { streaming = false } = {}) {
   node.classList.remove("plain");
   node.innerHTML = DOMPurify.sanitize(marked.parse(text || ""));
   node.querySelectorAll("a").forEach(a => { a.target = "_blank"; a.rel = "noopener noreferrer"; });
-  let index = 1;
+  let index = startIndex;
   node.querySelectorAll("pre > code").forEach(code => decorateCode(code, index++, streaming));
 }
 
@@ -311,6 +316,7 @@ function attachmentChip(a, { removable = false, onRemove } = {}) {
   const extra = a.encoding && a.encoding !== "UTF-8" ? ` · decoded as ${a.encoding}` : "";
   const chip = el("span", { class: "chip", title: `${a.name} · ${a.kind}${a.size ? " · " + fmtBytes(a.size) : ""}${extra}` });
   if (a.kind === "image" && a.content) chip.append(el("img", { src: a.content, alt: "" }));
+  if (a.kind === "image" && !a.content) { chip.classList.add("removed"); chip.title += " · image removed from this browser"; }
   chip.append(el("span", { class: "k", text: a.kind === "image" ? "img" : a.kind }), el("span", { class: "n", text: a.name }));
   if (extra) chip.append(el("span", { class: "k enc", text: a.encoding }));
   if (removable) chip.append(el("button", { class: "x", type: "button", title: "Remove", text: "×", onclick: onRemove }));
@@ -352,25 +358,172 @@ function statsText(s) {
 }
 
 function speakable(markdown) {
-  return markdown.replace(/```[\s\S]*?```/g, " (code block) ").replace(/`([^`]*)`/g, "$1")
+  return markdown.replace(/```[\s\S]*?```/g, "\n(code block)\n").replace(/`([^`]*)`/g, "$1")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/^#+\s*/gm, "").replace(/[*_~>|#-]{1,3}/g, " ").replace(/\s+/g, " ").trim();
+    .replace(/https?:\/\/\S+/g, "(link)")
+    .replace(/^\s*\|?[-:| ]+\|[-:| ]*$/gm, "")          // table separator rows
+    .replace(/\|/g, ", ")
+    .replace(/^#+\s*/gm, "").replace(/^\s*[-*+]\s+/gm, "").replace(/[*_~>#]{1,3}/g, "")
+    .replace(/[ \t]+/g, " ").trim();
 }
 
-function toggleSpeak(text, btn) {
-  if (!("speechSynthesis" in window)) return toast("Read aloud isn't supported in this browser.", true);
-  const wasMe = speaking === btn;
-  speechSynthesis.cancel();
-  if (speaking) { speaking.textContent = "Read aloud"; speaking.classList.remove("on"); speaking = null; }
-  if (wasMe) return;
-  const u = new SpeechSynthesisUtterance(speakable(text));
-  u.lang = document.documentElement.lang === "en" ? navigator.language : document.documentElement.lang;
-  u.onend = u.onerror = () => { if (speaking === btn) { btn.textContent = "Read aloud"; btn.classList.remove("on"); speaking = null; } };
-  speaking = btn;
-  btn.textContent = "■ Stop reading";
-  btn.classList.add("on");
-  speechSynthesis.speak(u);
+/** Sentence-ish chunks of ~60-240 characters (Kokoro sounds best in that range). */
+function splitForTTS(text) {
+  const parts = text.split(/(?<=[.!?…:;])\s+|\n+/).map(x => x.trim()).filter(Boolean);
+  const out = [];
+  let cur = "";
+  for (let part of parts) {
+    while (part.length > 300) {                       // very long sentence: break at a comma or space
+      let cut = part.lastIndexOf(", ", 240); if (cut < 80) cut = part.lastIndexOf(" ", 240); if (cut < 80) cut = 240;
+      out.push(part.slice(0, cut + 1).trim()); part = part.slice(cut + 1).trim();
+    }
+    if (cur && (cur.length + part.length > 240)) { out.push(cur); cur = part; }
+    else cur = cur ? cur + " " + part : part;
+    if (cur.length >= 60 && /[.!?…]$/.test(cur)) { out.push(cur); cur = ""; }
+  }
+  if (cur) out.push(cur);
+  return out;
 }
+
+/** Read aloud: Kokoro on the server when available (sentence by sentence, next one prefetched
+ *  while the current plays), otherwise the browser's built-in voice. */
+const Speaker = {
+  btn: null, label: "", ctrl: null, audio: null, resolvePlay: null,
+  setButton(btn) {
+    if (this.btn) { this.btn.textContent = this.label; this.btn.classList.remove("on"); }
+    this.btn = btn;
+    if (btn) { this.label = btn.textContent; btn.textContent = "■ Stop reading"; btn.classList.add("on"); }
+  },
+  stop() {
+    this.ctrl?.abort(); this.ctrl = null;
+    if (this.audio) { this.audio.pause(); this.audio = null; }
+    if (this.resolvePlay) { this.resolvePlay(); this.resolvePlay = null; }
+    if ("speechSynthesis" in window) speechSynthesis.cancel();
+    this.setButton(null);
+  },
+  toggle(text, btn, override = {}) {
+    const same = this.btn === btn;
+    this.stop();
+    if (same) return;
+    this.setButton(btn);
+    const o = { engine: PREFS.tts_engine, speed: PREFS.tts_speed || 1, voices: { pt: PREFS.voice_pt, en: PREFS.voice_en }, ...override };
+    const useKokoro = o.engine === "kokoro" && CONFIG.tts?.available;
+    (useKokoro ? this.kokoro(text, o) : this.browser(text, o)).catch(e => {
+      if (e.name === "AbortError") return;
+      toast(`Kokoro: ${e.message} — using the browser voice.`, true);
+      if (this.btn === btn) this.browser(text, o);
+    });
+  },
+  browser(text, o) {
+    return new Promise(resolve => {
+      if (!("speechSynthesis" in window)) { toast("Read aloud isn't supported in this browser.", true); this.setButton(null); return resolve(); }
+      const btn = this.btn;
+      const u = new SpeechSynthesisUtterance(speakable(text));
+      u.lang = navigator.language || "pt-BR";
+      u.rate = o.speed;
+      u.onend = u.onerror = () => { if (this.btn === btn) this.setButton(null); resolve(); };
+      speechSynthesis.speak(u);
+    });
+  },
+  async kokoro(text, o) {
+    const btn = this.btn;
+    const segs = splitForTTS(speakable(text));
+    if (!segs.length) { this.setButton(null); return; }
+    const ctrl = this.ctrl = new AbortController();
+    let hint = /[ãõçéá]/i.test(text) ? "pt" : "en";
+    const fetchSeg = async seg => {
+      const r = await fetch("/api/tts", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl.signal,
+        body: JSON.stringify({ text: seg, hint, speed: o.speed, voices: o.voices }) });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
+      hint = r.headers.get("X-TTS-Lang") || hint;
+      return URL.createObjectURL(await r.blob());
+    };
+    let next = fetchSeg(segs[0]);
+    for (let i = 0; i < segs.length; i++) {
+      const url = await next;
+      if (ctrl.signal.aborted) { URL.revokeObjectURL(url); return; }
+      if (i + 1 < segs.length) { next = fetchSeg(segs[i + 1]); next.catch(() => {}); }
+      await this.play(url);
+      if (ctrl.signal.aborted) return;
+    }
+    if (this.btn === btn) this.setButton(null);
+  },
+  play(url) {
+    return new Promise((resolve, reject) => {
+      const a = new Audio(url);
+      this.audio = a;
+      this.resolvePlay = resolve;
+      a.onended = () => { URL.revokeObjectURL(url); this.resolvePlay = null; resolve(); };
+      a.onerror = () => { URL.revokeObjectURL(url); reject(new Error("audio playback failed")); };
+      a.play().catch(reject);
+    });
+  },
+};
+function toggleSpeak(text, btn) { Speaker.toggle(text, btn); }
+
+/** Voice input: record in the browser, transcribe with faster-whisper on the server. */
+const Mic = {
+  rec: null, stream: null, chunks: [], timer: null, t0: 0, cancelled: false,
+  get active() { return this.rec?.state === "recording"; },
+  async toggle() { if (this.active) this.stop(); else await this.start(); },
+  async start() {
+    if (busy) return toast("Wait for the reply to finish.", true);
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia)
+      return toast("Voice input needs HTTPS — start the server with --https (see README).", true);
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    } catch (e) { return toast(`Microphone not available: ${e.message}`, true); }
+    const mime = ["audio/webm;codecs=opus", "audio/ogg;codecs=opus", "audio/mp4"].find(m => window.MediaRecorder?.isTypeSupported?.(m)) || "";
+    this.rec = new MediaRecorder(this.stream, mime ? { mimeType: mime } : {});
+    this.chunks = []; this.cancelled = false;
+    this.rec.ondataavailable = e => { if (e.data.size) this.chunks.push(e.data); };
+    this.rec.onstop = () => this.finish();
+    this.rec.start(250);
+    this.t0 = Date.now();
+    $("#micBtn").classList.add("rec");
+    const tick = () => {
+      const s = Math.floor((Date.now() - this.t0) / 1000);
+      setStatus(`● REC ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")} — 🎙 or Ctrl+M to stop · Esc to cancel`);
+      if (s >= 180) this.stop();
+    };
+    tick();
+    this.timer = setInterval(tick, 500);
+  },
+  stop(cancel = false) {
+    if (!this.rec) return;
+    this.cancelled = cancel;
+    if (this.rec.state !== "inactive") this.rec.stop();
+    this.stream?.getTracks().forEach(t => t.stop());
+  },
+  async finish() {
+    clearInterval(this.timer);
+    $("#micBtn").classList.remove("rec");
+    const type = this.rec?.mimeType || "audio/webm";
+    this.rec = null;
+    if (this.cancelled) { setStatus(""); return; }
+    const blob = new Blob(this.chunks, { type });
+    if (blob.size < 2000) { setStatus(""); return toast("Nothing was recorded.", true); }
+    setStatus("Transcribing…");
+    const form = new FormData();
+    form.append("audio", blob, "voice." + (type.includes("mp4") ? "mp4" : type.includes("ogg") ? "ogg" : "webm"));
+    if (PREFS.stt_lang) form.append("language", PREFS.stt_lang);
+    try {
+      const r = await fetch("/api/stt", { method: "POST", body: form });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      if (!data.text) return toast("No speech recognized.", true);
+      const input = $("#input");
+      const before = input.value.slice(0, input.selectionStart), after = input.value.slice(input.selectionEnd);
+      const sep = before && !/\s$/.test(before) ? " " : "";
+      input.value = before + sep + data.text + (after && !/^\s/.test(after) ? " " : "") + after;
+      const pos = (before + sep + data.text).length;
+      input.setSelectionRange(pos, pos);
+      input.dispatchEvent(new Event("input"));
+      input.focus();
+    } catch (e) { toast(`Transcription failed: ${e.message}`, true); }
+    finally { setStatus(""); }
+  },
+};
 
 function assistantActions(msg, turnIndex, isLast) {
   const bar = el("div", { class: "msg-actions" });
@@ -396,6 +549,7 @@ function renderAssistantTurn(msg, turnIndex, isLast) {
   const wrap = el("div");
   wrap.append(el("div", { class: "role" }, el("span", { text: "// " + (msg.model || "assistant") }), el("span", { class: "ts", text: fmtTime(msg.ts) })));
   if (PREFS.show_reasoning && msg.reasoning) wrap.append(thinkingBlock(msg.reasoning));
+  if (msg.tools?.length) wrap.append(toolsBlock(msg.tools));
   const body = el("div", { class: "msg assistant" });
   renderMarkdownInto(body, msg.content);
   wrap.append(body, assistantActions(msg, turnIndex, isLast));
@@ -430,13 +584,20 @@ function renderConversation() {
 }
 
 function renderPersonaPicker() {
+  let note = $("#contNote");
+  if (!note) { note = el("p", { id: "contNote", class: "cont-note" }); $("#personaPicker").before(note); }
+  const from = current.continued_from && conversations.find(c => c.id === current.continued_from);
+  note.hidden = !from;
+  if (from) note.textContent = `Continuing from “${from.title}” — its summary is attached below.`;
   const box = $("#personaPicker");
   box.innerHTML = "";
   const list = allPersonas();
   if (list.length < 2) return;
   for (const p of list) {
+    const extras = [p.model ? `model: ${p.model}` : "", p.reasoning ? `reasoning: ${p.reasoning}` : "",
+      p.tools?.length ? `tools: ${p.tools.join(", ")}` : ""].filter(Boolean).join(" · ");
     const b = el("button", { type: "button", class: "persona" + (p.name === current.persona ? " on" : ""),
-      title: p.system_prompt.slice(0, 300), text: p.name });
+      title: (extras ? extras + "\n\n" : "") + p.system_prompt.slice(0, 300), text: p.name });
     b.onclick = () => { usePersona(p); renderPersonaPicker(); $("#input").focus(); };
     box.append(b);
   }
@@ -446,7 +607,9 @@ function usePersona(p) {
   PREFS.persona = p.name; PREFS.system_prompt = p.system_prompt; PREFS.temperature = p.temperature ?? null;
   savePrefs();
   if (current.messages.length) { startNewChat(); toast(`New chat · ${p.name}`); return; }
-  current.persona = p.name; current.system_prompt = p.system_prompt; current.temperature = p.temperature ?? null;
+  Object.assign(current, { persona: p.name, system_prompt: p.system_prompt, temperature: p.temperature ?? null,
+    reasoning: p.reasoning ?? null, tools: p.tools?.length ? knownTools(p.tools) : defaultTools() });
+  if (p.model) current.model = p.model;
   renderConversation();
 }
 
@@ -456,7 +619,7 @@ function updateContextMeter() {
   const info = currentModelInfo();
   const last = [...current.messages].reverse().find(m => m.role === "assistant" && m.stats);
   const max = info?.context_length;
-  if (!max || !last) { meter.hidden = true; return; }
+  if (!max || !last) { meter.hidden = true; $("#ctxBanner").hidden = true; return; }
   const used = (last.stats.input_tokens || 0) + (last.stats.total_output_tokens || 0);
   const pct = Math.min(100, (used / max) * 100);
   meter.hidden = false;
@@ -465,7 +628,9 @@ function updateContextMeter() {
   meter.classList.toggle("warn", pct >= 75);
   meter.classList.toggle("full", pct >= 92);
   meter.title = `About ${used.toLocaleString()} of ${max.toLocaleString()} context tokens used` +
-    (pct >= 75 ? ". Near the limit the model starts forgetting the beginning — consider a new chat." : "");
+    (pct >= 75 ? ". Near the limit the model starts forgetting the beginning — use Summarize & continue." : "");
+  $("#ctxPct").textContent = Math.round(pct);
+  $("#ctxBanner").hidden = pct < 75 || !!current.ctx_dismissed || !!busy || !!editing;
 }
 
 /* ======================================================================= sidebar */
@@ -571,9 +736,54 @@ function syncModelSelect() {
     sel.append(el("option", { value: m.key, text: m.name + (flags ? `  (${flags})` : "") }));
   }
   sel.value = want;
+  syncReasoningSelect();
+  renderToolsMenu();
 }
 
-function currentModelInfo() { return MODELS.find(m => m.key === (current?.model || CONFIG.model)); }
+function modelInfo(key) { return MODELS.find(m => m.key === key); }
+function currentModelInfo() { return modelInfo(current?.model || CONFIG.model); }
+
+/** Reasoning effort picker — only shown for models that report reasoning options. */
+function syncReasoningSelect() {
+  const sel = $("#reasoningSelect");
+  const info = currentModelInfo();
+  const opts = info?.reasoning_options || [];
+  if (!opts.length) { sel.hidden = true; return; }
+  sel.hidden = false;
+  sel.innerHTML = "";
+  sel.append(el("option", { value: "", text: `🧠 auto${info.reasoning_default ? ` (${info.reasoning_default})` : ""}` }));
+  for (const o of opts) sel.append(el("option", { value: o, text: `🧠 ${o}` }));
+  sel.value = opts.includes(current?.reasoning) ? current.reasoning : "";
+}
+
+/** Tools (MCP integrations from config.json) the model may use in this chat. */
+function renderToolsMenu() {
+  const list = CONFIG.integrations || [];
+  $("#toolsWrap").hidden = !list.length;
+  if (!list.length || !current) return;
+  const on = new Set(current.tools || []);
+  const menu = $("#toolsMenu");
+  menu.replaceChildren(el("div", { class: "menu-head", text: "Tools for this chat" }));
+  for (const t of list) {
+    const cb = el("input", { type: "checkbox" });
+    cb.checked = on.has(t.name);
+    cb.onchange = async () => {
+      const set = new Set(current.tools || []);
+      cb.checked ? set.add(t.name) : set.delete(t.name);
+      current.tools = list.map(x => x.name).filter(n => set.has(n));
+      if (current.messages.length) await persist(current, { touch: false });
+      renderToolsMenu();
+    };
+    menu.append(el("label", { class: "tool-opt", title: t.description || "" }, cb, el("span", { text: t.name }),
+      el("span", { class: "k", text: t.kind === "plugin" ? "mcp.json" : "url" })));
+  }
+  const info = currentModelInfo();
+  if (info && !info.tools) menu.append(el("div", { class: "menu-note warn", text: "This model isn't marked as trained for tool use — results may be poor." }));
+  menu.append(el("div", { class: "menu-note", text: "LM Studio must allow it: Server settings → “Allow calling servers from mcp.json” (and “Allow per-request MCPs” for URL tools)." }));
+  const n = on.size;
+  $("#toolsCount").textContent = n;
+  $("#toolsBtn").classList.toggle("on", n > 0);
+}
 
 /* ======================================================================= attachments */
 async function addFiles(fileList) {
@@ -679,14 +889,153 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && titleBeforeAlert != null) { document.title = titleBeforeAlert; titleBeforeAlert = null; }
 });
 
+/* ======================================================================= live reply (streaming UI) */
+
+function toolItem(t) {
+  const state = t.running ? "running…" : t.ok === false ? "failed" : "done";
+  const d = el("details", { class: "tool " + (t.running ? "run" : t.ok === false ? "bad" : "ok") },
+    el("summary", {}, el("span", { class: "tname", text: "⚙ " + (t.tool || "tool") }),
+      t.provider ? el("span", { class: "tprov", text: t.provider }) : null, el("span", { class: "tstate", text: state })));
+  if (t.arguments) d.append(el("div", { class: "tlabel", text: "arguments" }), el("pre", { class: "tpre", text: t.arguments }));
+  if (t.output) d.append(el("div", { class: "tlabel", text: t.ok === false ? "error" : "output" }), el("pre", { class: "tpre", text: t.output }));
+  return d;
+}
+function toolsBlock(tools) { return el("div", { class: "tools" }, tools.map(toolItem)); }
+
+/** The assistant turn while a reply streams in. Only the unfinished tail of the Markdown is
+ *  re-rendered on each update; completed paragraphs/blocks are rendered once and kept. */
+class LiveReply {
+  constructor(label) {
+    this.turn = el("div", { class: "turn live" });
+    this.thinkBody = el("div", { class: "think-body" });
+    this.thinking = el("details", { class: "thinking", hidden: true }, el("summary", { text: "Thinking…" }), this.thinkBody);
+    this.thinking.open = true;
+    this.toolsBox = el("div", { class: "tools", hidden: true });
+    this.body = el("div", { class: "msg assistant cursor" });
+    this.stable = el("div", { class: "md-part" });
+    this.tail = el("div", { class: "md-part" });
+    this.body.append(this.stable, this.tail);
+    this.chip = el("div", { class: "status-chip" }, el("span", { class: "spinner" }), el("span", { class: "phase", text: "Connecting…" }), el("span", { class: "clock" }));
+    this.turn.append(el("div", { class: "role" }, el("span", { text: label })), this.thinking, this.toolsBox, this.body, this.chip);
+    this.streamed = ""; this.reasoning = ""; this.tools = [];
+    this.stableLen = 0; this.codeCount = 0; this.queued = false;
+    this.started = performance.now();
+    const phase = this.chip.querySelector(".phase"), clock = this.chip.querySelector(".clock");
+    this.phase = t => { phase.textContent = t; };
+    this.tick = setInterval(() => {
+      const secs = (performance.now() - this.started) / 1000;
+      const tok = Math.round((this.streamed.length + this.reasoning.length) / 4);
+      clock.textContent = `${secs.toFixed(1)}s` + (tok ? ` · ~${tok} tok · ~${(tok / secs).toFixed(1)} tok/s` : "");
+    }, 250);
+  }
+  onEvent(ev) {
+    if (ev.type === "delta") { this.streamed += ev.content; this.phase("Writing"); this.queuePaint(); }
+    else if (ev.type === "reasoning") {
+      this.reasoning += ev.content;
+      this.phase("Thinking");
+      if (PREFS.show_reasoning) { this.thinking.hidden = false; this.thinkBody.textContent = fix(this.reasoning); this.thinkBody.scrollTop = this.thinkBody.scrollHeight; scrollBottom(); }
+    }
+    else if (ev.type === "tool") this.onTool(ev);
+    else if (ev.type === "status") this.phase(ev.text.replace(/…$/, ""));
+    else if (ev.type === "server_error") this.phase("Server error: " + ev.message);
+  }
+  onTool(ev) {
+    let t = [...this.tools].reverse().find(x => x.running && (!ev.tool || x.tool === ev.tool));
+    if (ev.phase === "start" || !t) { t = { tool: ev.tool, provider: ev.provider || "", running: true }; this.tools.push(t); }
+    if (ev.arguments) t.arguments = ev.arguments;
+    if (ev.phase === "success") { t.running = false; t.ok = true; t.output = ev.output; }
+    if (ev.phase === "failure") { t.running = false; t.ok = false; t.output = ev.output; }
+    this.phase(t.running ? `Tool: ${t.tool}` : "Thinking");
+    this.toolsBox.hidden = false;
+    this.toolsBox.replaceChildren(...this.tools.map(toolItem));
+    scrollBottom();
+  }
+  queuePaint() { if (!this.queued) { this.queued = true; setTimeout(() => this.paint(), 60); } }
+  paint() {
+    this.queued = false;
+    const stick = nearBottom();
+    const text = fix(this.streamed);
+    if (!PREFS.markdown) {
+      this.stable.replaceChildren(); this.body.classList.add("plain"); this.tail.textContent = text;
+    } else {
+      this.body.classList.remove("plain");
+      // Commit everything up to the last blank line, unless that would split a ``` fence.
+      const cut = text.lastIndexOf("\n\n");
+      if (cut > this.stableLen) {
+        const chunk = text.slice(this.stableLen, cut);
+        if ((chunk.match(/^ {0,3}(```|~~~)/gm) || []).length % 2 === 0) {
+          const holder = el("div");
+          renderMarkdownInto(holder, chunk, { startIndex: this.codeCount + 1 });
+          this.codeCount += holder.querySelectorAll(".code-block").length;
+          this.stable.append(...holder.childNodes);
+          this.stableLen = cut;
+        }
+      }
+      renderMarkdownInto(this.tail, text.slice(this.stableLen), { streaming: true, startIndex: this.codeCount + 1 });
+    }
+    if (stick) scrollBottom(true);
+  }
+  finish() {
+    clearInterval(this.tick);
+    this.chip.remove();
+    this.body.classList.remove("cursor");
+    this.thinking.querySelector("summary").textContent = "Thinking";
+  }
+  /** Re-render the partial text in one piece (used when keeping a failed/stopped reply). */
+  renderWhole() { if (this.streamed) renderMarkdownInto(this.body, fix(this.streamed)); }
+}
+
+/** POST /api/chat and feed NDJSON events to onEvent. Resolves to { end, fatal }. */
+async function streamChat(reqBody, signal, onEvent) {
+  let end = null, fatal = null;
+  try {
+    const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(reqBody), signal });
+    if (!r.ok) {
+      const data = await r.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${r.status}`);
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === "end") end = ev;
+        else if (ev.type === "fatal") fatal = ev;
+        else onEvent(ev);
+      }
+    }
+    if (!end && !fatal) fatal = { message: "Connection closed before the reply finished; context not advanced." };
+  } catch (e) {
+    fatal = e.name === "AbortError"
+      ? { message: "The partial reply was not saved and the conversation context was not advanced.", stopped: true }
+      : { message: `Could not reach the web server: ${e.message}` };
+  }
+  return { end, fatal };
+}
+
+function reasoningFor(conv) {
+  const opts = modelInfo(conv.model)?.reasoning_options || [];
+  return opts.includes(conv.reasoning) ? conv.reasoning : undefined;
+}
+
 async function send(opts = {}) {
   if (busy) return;
   const input = $("#input");
   const fromComposer = opts.text === undefined;
   const text = fromComposer ? input.value.trim() : opts.text;
-  const attachments = fromComposer ? pending.slice() : opts.attachments;
+  const attachments = (fromComposer ? pending.slice() : opts.attachments).filter(a => a.content);
   if (!text && !attachments.length) return;
-  if (speaking) toggleSpeak("", speaking);
+  Speaker.stop();
 
   $$(".turn.failed").forEach(n => n.remove());
   const conv = current;
@@ -707,16 +1056,11 @@ async function send(opts = {}) {
 
   // Optimistic UI (not saved until the reply completes).
   $("#empty").hidden = true;
+  $("#ctxBanner").hidden = true;
   $$(".turn").forEach(t => { if (+t.dataset.idx >= baseLen) t.hidden = true; });
   const userTurn = el("div", { class: "turn live" }, renderUserTurn(userMsg, null));
-  const asstTurn = el("div", { class: "turn live" });
-  const thinkBody = el("div", { class: "think-body" });
-  const thinking = el("details", { class: "thinking", hidden: true }, el("summary", { text: "Thinking…" }), thinkBody);
-  thinking.open = true;
-  const body = el("div", { class: "msg assistant cursor" });
-  const live = el("div", { class: "status-chip" }, el("span", { class: "spinner" }), el("span", { class: "phase", text: "Connecting…" }), el("span", { class: "clock" }));
-  asstTurn.append(el("div", { class: "role" }, el("span", { text: "// " + conv.model })), thinking, body, live);
-  messagesEl().append(userTurn, asstTurn);
+  const reply = new LiveReply("// " + conv.model);
+  messagesEl().append(userTurn, reply.turn);
   scrollBottom(true);
 
   if (fromComposer) { input.value = ""; autosize(); pending = []; renderPending(); conv.draft = ""; }
@@ -730,78 +1074,21 @@ async function send(opts = {}) {
     system_prompt: conv.system_prompt,
     temperature: conv.temperature,
     max_output_tokens: conv.max_output_tokens,
+    reasoning: reasoningFor(conv),
+    tools: conv.tools || [],
   };
 
-  const controller = new AbortController();
-  busy = { controller };
+  busy = { controller: new AbortController() };
   setBusy(true);
-  const started = performance.now();
-  let streamed = "", reasoning = "", end = null, fatal = null, renderQueued = false;
-  const phase = live.querySelector(".phase"), clock = live.querySelector(".clock");
-  const tick = setInterval(() => {
-    const secs = (performance.now() - started) / 1000;
-    const approxTok = Math.round((streamed.length + reasoning.length) / 4);
-    clock.textContent = `${secs.toFixed(1)}s` + (approxTok ? ` · ~${approxTok} tok · ~${(approxTok / secs).toFixed(1)} tok/s` : "");
-  }, 250);
-
-  const paint = () => {
-    renderQueued = false;
-    const stick = nearBottom();
-    renderMarkdownInto(body, fix(streamed), { streaming: true });
-    if (stick) scrollBottom(true);
-  };
-  const queuePaint = () => { if (!renderQueued) { renderQueued = true; setTimeout(paint, 60); } };
-
-  try {
-    const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(reqBody), signal: controller.signal });
-    if (!r.ok) {
-      const data = await r.json().catch(() => ({}));
-      throw new Error(data.error || `HTTP ${r.status}`);
-    }
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        let ev;
-        try { ev = JSON.parse(line); } catch { continue; }
-        if (ev.type === "delta") { streamed += ev.content; phase.textContent = "Writing"; queuePaint(); }
-        else if (ev.type === "reasoning") {
-          reasoning += ev.content;
-          phase.textContent = "Thinking";
-          if (PREFS.show_reasoning) { thinking.hidden = false; thinkBody.textContent = fix(reasoning); thinkBody.scrollTop = thinkBody.scrollHeight; scrollBottom(); }
-        }
-        else if (ev.type === "status") phase.textContent = ev.text.replace(/…$/, "");
-        else if (ev.type === "server_error") phase.textContent = "Server error: " + ev.message;
-        else if (ev.type === "end") end = ev;
-        else if (ev.type === "fatal") fatal = ev;
-      }
-    }
-    if (!end && !fatal) fatal = { message: "Connection closed before the reply finished; context not advanced." };
-  } catch (e) {
-    fatal = e.name === "AbortError"
-      ? { message: "The partial reply was not saved and the conversation context was not advanced.", stopped: true }
-      : { message: `Could not reach the web server: ${e.message}` };
-  }
-
-  clearInterval(tick);
+  const { end, fatal } = await streamChat(reqBody, busy.controller.signal, ev => reply.onEvent(ev));
   busy = null;
   setBusy(false);
   setStatus("");
-  live.remove();
-  body.classList.remove("cursor");
+  reply.finish();
 
   if (end) {
-    const asst = { role: "assistant", content: fix(end.answer), reasoning: fix(end.reasoning || reasoning), stats: end.stats,
-      model: conv.model, ts: Date.now(), response_id: end.response_id };
+    const asst = { role: "assistant", content: fix(end.answer), reasoning: fix(end.reasoning || reply.reasoning), stats: end.stats,
+      model: conv.model, ts: Date.now(), response_id: end.response_id, tools: end.tools?.length ? end.tools : undefined };
     conv.messages = [...prior, userMsg, asst];
     conv.previous_response_id = end.response_id || null;
     if (!end.response_id) toast("No response_id returned; the next message will resend the saved history.", true);
@@ -822,15 +1109,14 @@ async function send(opts = {}) {
   // Failure: keep partial output visible (copyable), restore input + files, don't advance context.
   if (current !== conv) return;
   if (editing) { $$(".turn").forEach(t => { if (t.dataset.idx !== undefined) t.hidden = false; }); }
-  if (streamed) paint();
-  thinking.querySelector("summary").textContent = "Thinking";
+  reply.renderWhole();
   userTurn.classList.add("failed");
-  asstTurn.classList.add("failed");
+  reply.turn.classList.add("failed");
   const box = el("div", { class: "error-box" }, el("b", { text: fatal.stopped ? "Stopped. " : "Failed. " }), fatal.message);
   box.append(el("div", { class: "muted", text: "Your message and files are back in the input box. Nothing is retried automatically." }));
-  if (streamed) {
+  if (reply.streamed) {
     const cp = el("button", { class: "btn", type: "button", text: "Copy partial reply" });
-    cp.onclick = () => copyWithFeedback(fix(streamed), cp, "Copy partial reply");
+    cp.onclick = () => copyWithFeedback(fix(reply.streamed), cp, "Copy partial reply");
     box.append(cp);
   }
   if (fatal.previous_id_rejected && prior.length) {
@@ -839,11 +1125,69 @@ async function send(opts = {}) {
     rb.onclick = () => send({ rebuild: true });
     box.append(rb);
   }
-  asstTurn.append(box);
+  reply.turn.append(box);
   scrollBottom(true);
   if (!input.value) { input.value = text; autosize(); }
   pending = [...attachments, ...pending.filter(p => !attachments.includes(p))];
   renderPending();
+}
+
+/* ======================================================================= summarize & continue */
+const SUMMARY_PROMPT = "Summarize our conversation so far so it can continue in a fresh chat that has no other context. " +
+  "Include: the goal, key facts and findings, decisions made, essential code, commands or indicators (verbatim when they matter), " +
+  "and open questions or next steps. Be complete but compact, use Markdown headings, and write in the language the conversation mostly used.";
+
+async function summarizeAndContinue({ rebuild = false } = {}) {
+  if (busy) return;
+  const conv = current;
+  if (!conv.messages.length) return toast("Nothing to summarize yet.", true);
+  if (editing) cancelEdit();
+  Speaker.stop();
+  $$(".turn.failed").forEach(n => n.remove());
+  $("#ctxBanner").hidden = true;
+  const reply = new LiveReply("// summary for a new chat");
+  messagesEl().append(reply.turn);
+  scrollBottom(true);
+  const useHistory = rebuild || !conv.previous_response_id;
+  const reqBody = {
+    message: SUMMARY_PROMPT,
+    attachments: useHistory ? [{ name: "conversation_history.md", kind: "text", content: transcriptForRebuild(conv.messages) }] : [],
+    model: conv.model,
+    previous_response_id: useHistory ? null : conv.previous_response_id,
+    system_prompt: conv.system_prompt,
+    store: false,                       // the summary request doesn't become part of the old chat
+    temperature: 0.2,
+    reasoning: (modelInfo(conv.model)?.reasoning_options || []).includes("off") ? "off" : undefined,
+  };
+  busy = { controller: new AbortController() };
+  setBusy(true);
+  const { end, fatal } = await streamChat(reqBody, busy.controller.signal, ev => reply.onEvent(ev));
+  busy = null;
+  setBusy(false);
+  reply.finish();
+  if (!end) {
+    reply.renderWhole();
+    reply.turn.classList.add("failed");
+    const box = el("div", { class: "error-box" }, el("b", { text: fatal.stopped ? "Stopped. " : "Summary failed. " }), fatal.message);
+    if (fatal.previous_id_rejected) {
+      const rb = el("button", { class: "btn primary", type: "button", text: "Summarize from saved history" });
+      rb.onclick = () => summarizeAndContinue({ rebuild: true });
+      box.append(rb);
+    }
+    reply.turn.append(box);
+    return;
+  }
+  reply.turn.remove();
+  const summary = fix(end.answer);
+  const next = { ...newConversation(), persona: conv.persona, system_prompt: conv.system_prompt, temperature: conv.temperature,
+    max_output_tokens: conv.max_output_tokens, model: conv.model, reasoning: conv.reasoning ?? null, tools: [...(conv.tools || [])],
+    title: "↳ " + conv.title.replace(/^↳ /, "").slice(0, 58), continued_from: conv.id };
+  conv.continued_in = next.id;
+  await persist(conv, { touch: false });
+  openConversation(next);
+  pending = [{ name: "previous_chat_summary.md", kind: "text", content: summary, size: summary.length }];
+  renderPending();
+  toast("Summary attached — it goes with your first message in this new chat.");
 }
 
 /* ======================================================================= exports / imports */
@@ -880,6 +1224,7 @@ async function chatAction(act) {
     downloadText(JSON.stringify({ format: "local-llm-chat", version: 1, conversation: conv }, null, 2), `${base}.json`, "application/json");
   }
   else if (act === "export-code") downloadZip(allCodeFiles(conv), `${base}_code.zip`);
+  else if (act === "summarize") summarizeAndContinue();
   else if (act === "pin") { if (empty) return toast("Send a message first.", true); conv.pinned = !conv.pinned; await persist(conv, { touch: false }); toast(conv.pinned ? "Pinned" : "Unpinned"); }
   else if (act === "duplicate") {
     if (empty) return toast("This chat is empty.", true);
@@ -1002,7 +1347,105 @@ function openSettings() {
   $("#setFx").checked = PREFS.effects;
   $("#setFont").value = PREFS.font_size;
   syncPersonaButtons();
+  fillVoiceSettings();
+  showStorageInfo();
+  $("#pwCurrent").value = ""; $("#pwNew").value = ""; $("#pwResult").textContent = "";
   $("#settingsDlg").showModal();
+  refreshServerStatus();
+}
+
+/** Re-read TTS/STT status (models may have finished loading since the page opened). */
+async function refreshServerStatus() {
+  try {
+    const r = await fetch("/api/config");
+    if (!r.ok) return;
+    const c = await r.json();
+    CONFIG.tts = c.tts; CONFIG.stt = c.stt;
+    fillVoiceStatus();
+    syncMicButton();
+  } catch { /* offline */ }
+}
+
+function fillVoiceStatus() {
+  const t = CONFIG.tts || {}, s = CONFIG.stt || {};
+  const tts = t.available ? (t.ready ? "Kokoro ready." : "Kokoro installed — loading (the first run downloads the model).")
+    : t.installed && t.error ? `Kokoro failed to load: ${t.error}` : t.enabled === false ? "Kokoro disabled in config.json." : "Kokoro is not installed on the server — the browser voice is used.";
+  const stt = s.available ? (window.isSecureContext ? `Voice input ready (Whisper ${s.model}${s.ready ? "" : ", loading"}).` : "Voice input is installed but needs HTTPS — start the server with --https.")
+    : s.installed && s.error ? `Voice input failed to load: ${s.error}` : "Voice input (faster-whisper) is not installed on the server.";
+  const box = $("#voiceStatus");
+  box.className = "conn-result " + (t.available ? "ok" : "");
+  box.textContent = `${tts}  ${stt}`;
+  $("#setTtsEngine").querySelector('option[value="kokoro"]').disabled = !t.available;
+}
+
+function fillVoiceSettings() {
+  const v = CONFIG.tts?.voices || { pt: ["pf_dora", "pm_alex", "pm_santa"], en: ["af_heart"] };
+  const fill = (sel, list, val) => { sel.replaceChildren(...list.map(x => el("option", { value: x, text: x }))); sel.value = list.includes(val) ? val : list[0]; };
+  fill($("#setVoicePt"), v.pt, PREFS.voice_pt);
+  fill($("#setVoiceEn"), v.en, PREFS.voice_en);
+  $("#setTtsEngine").value = PREFS.tts_engine === "kokoro" && CONFIG.tts?.available ? "kokoro" : "browser";
+  $("#setTtsSpeed").value = PREFS.tts_speed || 1;
+  $("#speedVal").textContent = `${Number(PREFS.tts_speed || 1).toFixed(2)}×`;
+  $("#setSttLang").value = PREFS.stt_lang || "";
+  fillVoiceStatus();
+}
+
+/* ======================================================================= storage */
+function storageStats() {
+  let total = 0, images = 0, imageCount = 0;
+  for (const c of conversations) {
+    total += JSON.stringify(c).length;
+    for (const m of c.messages) for (const a of m.attachments || [])
+      if (a.kind === "image" && a.content) { images += a.content.length; imageCount++; }
+  }
+  return { total, images, imageCount, chats: conversations.filter(c => c.messages.length).length };
+}
+
+function showStorageInfo() {
+  const s = storageStats();
+  $("#storageInfo").textContent = `${s.chats} chats · about ${fmtBytes(s.total)} in total · ${s.imageCount} stored image${s.imageCount === 1 ? "" : "s"} (${fmtBytes(Math.round(s.images * 0.75))})`;
+}
+
+async function stripImages(olderThanDays) {
+  const cutoff = olderThanDays == null ? Infinity : Date.now() - olderThanDays * 864e5;
+  if (olderThanDays == null && !confirm("Remove every stored image from all chats in this browser?")) return;
+  let removed = 0;
+  for (const c of conversations) {
+    let changed = false;
+    for (const m of c.messages) {
+      if ((m.ts || c.updated) >= cutoff) continue;
+      for (const a of m.attachments || []) if (a.kind === "image" && a.content) { a.content = null; changed = true; removed++; }
+    }
+    if (changed) await DB.put(c).catch(() => {});
+  }
+  showStorageInfo();
+  if (!busy) renderConversation();
+  toast(removed ? `Removed ${removed} image${removed > 1 ? "s" : ""}.` : "No images to remove.");
+}
+
+/* ======================================================================= account */
+async function changePassword() {
+  const out = $("#pwResult");
+  out.className = "conn-result";
+  try {
+    await postJSON("/api/password", { current: $("#pwCurrent").value, new: $("#pwNew").value });
+    out.className = "conn-result ok"; out.textContent = "✓ Password changed. Other devices must log in again.";
+    $("#pwCurrent").value = ""; $("#pwNew").value = "";
+  } catch (e) { out.className = "conn-result bad"; out.textContent = "✕ " + e.message; }
+}
+
+async function logout() {
+  Speaker.stop();
+  if (current?.messages.length) { current.draft = $("#input").value; await DB.put(current).catch(() => {}); }
+  await fetch("/api/logout", { method: "POST" }).catch(() => {});
+  location.replace("/login");
+}
+
+function syncMicButton() {
+  const b = $("#micBtn");
+  b.hidden = !CONFIG.stt?.available;
+  b.classList.toggle("needs-https", !window.isSecureContext);
+  b.title = window.isSecureContext ? "Voice input (Ctrl+M)" : "Voice input needs HTTPS — start the server with --https";
 }
 
 function syncPersonaButtons() {
@@ -1032,6 +1475,8 @@ async function saveSettings() {
     persona: personaName, system_prompt: sys, temperature: t.ok ? t.value : PREFS.temperature, max_output_tokens: mx.ok ? mx.value : PREFS.max_output_tokens,
     markdown: $("#setMarkdown").checked, show_reasoning: $("#setReasoning").checked, show_stats: $("#setStats").checked,
     fix_encoding: $("#setFix").checked, enter_sends: $("#setEnter").checked, effects: $("#setFx").checked, font_size: $("#setFont").value,
+    tts_engine: $("#setTtsEngine").value, tts_speed: Number($("#setTtsSpeed").value) || 1,
+    voice_pt: $("#setVoicePt").value, voice_en: $("#setVoiceEn").value, stt_lang: $("#setSttLang").value,
   });
   savePrefs();
   applyLook();
@@ -1044,6 +1489,10 @@ async function saveSettings() {
     toast("System prompt changed — started a new chat.");
   } else {
     Object.assign(current, { system_prompt: sys, persona: personaName, temperature: PREFS.temperature, max_output_tokens: PREFS.max_output_tokens });
+    if (!current.messages.length && p && personaName === p.name) {
+      Object.assign(current, { reasoning: p.reasoning ?? null, tools: p.tools?.length ? knownTools(p.tools) : defaultTools() });
+      if (p.model) current.model = p.model;
+    }
     if (current.messages.length) await persist(current, { touch: false });
     if (PREFS.fix_encoding) await repairStoredChats();
     renderConversation();
@@ -1054,7 +1503,8 @@ function savePersona() {
   const name = prompt("Persona name", $("#setPersona").value === "Default" ? "" : $("#setPersona").value);
   if (!name || !name.trim()) return;
   const t = readNumber("#setTemp", { min: 0, max: 1 });
-  const p = { name: name.trim().slice(0, 40), system_prompt: $("#setSystem").value.trim() || CONFIG.system_prompt, temperature: t.ok ? t.value : null };
+  const p = { name: name.trim().slice(0, 40), system_prompt: $("#setSystem").value.trim() || CONFIG.system_prompt, temperature: t.ok ? t.value : null,
+    model: current.model || null, reasoning: current.reasoning ?? null, tools: [...(current.tools || [])] };
   PREFS.user_personas = [...(PREFS.user_personas || []).filter(x => x.name !== p.name), p];
   savePrefs();
   const sel = $("#setPersona");
@@ -1102,8 +1552,12 @@ function bindEvents() {
     const ctrl = e.ctrlKey || e.metaKey;
     if (e.key === "Escape") {
       if ($("dialog[open]")) return;
-      if (busy) busy.controller.abort(); else if (editing) cancelEdit();
+      if (Mic.active) Mic.stop(true);
+      else if (busy) busy.controller.abort();
+      else if (editing) cancelEdit();
+      else if (Speaker.btn) Speaker.stop();
     }
+    if (ctrl && e.key.toLowerCase() === "m" && CONFIG.stt?.available) { e.preventDefault(); Mic.toggle(); }
     if (ctrl && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); startNewChat(); }
     if (ctrl && e.key.toLowerCase() === "k") { e.preventDefault(); $("#app").classList.add("side-open"); $("#search").focus(); }
     if (ctrl && e.key === "/") { e.preventDefault(); $("#helpDlg").showModal(); }
@@ -1146,12 +1600,32 @@ function bindEvents() {
     savePrefs();
     if (current.messages.length) await persist(current, { touch: false });
     renderPending();
+    syncReasoningSelect();
+    renderToolsMenu();
     updateContextMeter();
   };
+  $("#reasoningSelect").onchange = async e => {
+    current.reasoning = e.target.value || null;
+    if (current.messages.length) await persist(current, { touch: false });
+  };
 
-  $("#chatMenuBtn").onclick = e => { e.stopPropagation(); $("#chatMenu").hidden = !$("#chatMenu").hidden; };
+  const closeMenus = except => { for (const id of ["#chatMenu", "#toolsMenu"]) if (id !== except) $(id).hidden = true; };
+  $("#chatMenuBtn").onclick = e => { e.stopPropagation(); closeMenus("#chatMenu"); $("#chatMenu").hidden = !$("#chatMenu").hidden; };
+  $("#toolsBtn").onclick = e => { e.stopPropagation(); closeMenus("#toolsMenu"); $("#toolsMenu").hidden = !$("#toolsMenu").hidden; };
   $("#chatMenu").addEventListener("click", e => { const act = e.target.closest("[data-act]")?.dataset.act; if (act) chatAction(act); });
-  document.addEventListener("click", e => { if (!e.target.closest(".menu-wrap")) $("#chatMenu").hidden = true; });
+  document.addEventListener("click", e => { if (!e.target.closest(".menu-wrap")) closeMenus(); });
+
+  $("#summarizeBtn").onclick = () => summarizeAndContinue();
+  $("#ctxDismiss").onclick = async () => { current.ctx_dismissed = true; $("#ctxBanner").hidden = true; if (current.messages.length) await persist(current, { touch: false }); };
+  $("#micBtn").onclick = () => Mic.toggle();
+  $("#logoutBtn").onclick = logout;
+  $("#changePw").onclick = changePassword;
+  $("#stripOldImages").onclick = () => stripImages(7);
+  $("#stripAllImages").onclick = () => stripImages(null);
+  $("#setTtsSpeed").oninput = e => { $("#speedVal").textContent = `${Number(e.target.value).toFixed(2)}×`; };
+  $("#testVoice").onclick = () => Speaker.toggle("Olá! Este é um teste da voz em português. And this sentence is spoken in English.",
+    $("#testVoice span"), { engine: $("#setTtsEngine").value, speed: Number($("#setTtsSpeed").value) || 1,
+      voices: { pt: $("#setVoicePt").value, en: $("#setVoiceEn").value } });
 
   $("#settingsBtn").onclick = () => { closeSidebar(); openSettings(); };
   $("#helpBtn").onclick = () => { closeSidebar(); $("#helpDlg").showModal(); };
@@ -1171,6 +1645,8 @@ function bindEvents() {
     $("#setStats").checked = CONFIG.show_stats;
     $("#setFix").checked = CONFIG.fix_encoding;
     $("#setEnter").checked = true; $("#setFx").checked = true; $("#setFont").value = "m";
+    $("#setTtsEngine").value = CONFIG.tts?.available ? "kokoro" : "browser";
+    $("#setTtsSpeed").value = CONFIG.tts?.speed || 1; $("#speedVal").textContent = `${Number(CONFIG.tts?.speed || 1).toFixed(2)}×`;
     syncPersonaButtons();
   };
 
@@ -1186,15 +1662,30 @@ function bindEvents() {
 }
 
 /* ======================================================================= boot */
+
+// Session expired / password changed elsewhere: any 401 from the API goes back to the login page.
+const nativeFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const r = await nativeFetch(...args);
+  if (r.status === 401 && String(args[0]).startsWith("/api/")) {
+    if (current?.messages.length) { current.draft = $("#input").value; await DB.put(current).catch(() => {}); }
+    location.replace("/login");
+  }
+  return r;
+};
+
 async function boot() {
   try {
-    CONFIG = await (await fetch("/api/config")).json();
+    const r = await fetch("/api/config");
+    if (r.status === 401) return;
+    CONFIG = await r.json();
   } catch (e) {
     document.body.textContent = "Could not load configuration from the web server: " + e.message;
     return;
   }
   loadPrefs();
   applyLook();
+  syncMicButton();
   $("#linkInfo").textContent = `LINK ${CONFIG.server}`;
   bindEvents();
   try {

@@ -338,3 +338,79 @@ fieldset.conn legend { font: .74em var(--mono); color: var(--cyan); letter-spaci
 }
 #settingsForm input:-webkit-autofill { -webkit-box-shadow: 0 0 0 40px var(--bg-2) inset; -webkit-text-fill-color: var(--cyan); }
 #settingsForm input:disabled { opacity: .45; }
+
+/* ------------------------------------------------------------ streaming parts */
+.md-part { display: contents; }
+
+/* ------------------------------------------------------------ reasoning + tools pickers */
+#reasoningSelect { --cut: 6px; max-width: 150px; padding: 6px 8px; border: 1px solid var(--line-hi); background: var(--bg-2); font: .8em var(--mono); color: var(--magenta); outline: none;
+  clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut)); }
+#reasoningSelect:focus { border-color: var(--magenta); }
+.chip-btn { border: 1px solid var(--line-hi); background: var(--bg-2); color: var(--muted); font: .74em var(--mono); letter-spacing: .1em; padding: 6px 9px; cursor: pointer;
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px); }
+.chip-btn:hover { color: var(--cyan); border-color: var(--cyan); }
+.chip-btn.on { color: var(--acid); border-color: rgba(212,255,58,.5); }
+.chip-btn .count { color: inherit; opacity: .8; }
+.tools-menu { min-width: 300px; }
+.menu-head { font: .72em var(--mono); color: var(--cyan); letter-spacing: .14em; text-transform: uppercase; padding: 6px 10px 4px; }
+.tool-opt { display: flex; align-items: center; gap: 8px; padding: 7px 10px; cursor: pointer; font-size: .9em; }
+.tool-opt:hover { background: rgba(0,240,255,.06); }
+.tool-opt input { accent-color: var(--magenta); }
+.tool-opt .k { margin-left: auto; font: .78em var(--mono); color: var(--muted); }
+.menu-note { font-size: .76em; color: var(--muted); padding: 6px 10px 4px; border-top: 1px solid var(--line); margin-top: 4px; line-height: 1.45; }
+.menu-note.warn { color: var(--warn); }
+
+/* ------------------------------------------------------------ tool calls in replies */
+.tools { display: grid; gap: 6px; margin: 0 0 10px 14px; }
+details.tool { border: 1px solid var(--line-hi); background: rgba(0,240,255,.03); padding: 5px 12px; font-size: .86em;
+  clip-path: polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px); }
+details.tool summary { cursor: pointer; display: flex; gap: 10px; align-items: baseline; list-style: none; }
+details.tool summary::-webkit-details-marker { display: none; }
+details.tool .tname { font: .95em var(--mono); color: var(--cyan); }
+details.tool .tprov { font: .8em var(--mono); color: var(--muted); }
+details.tool .tstate { margin-left: auto; font: .78em var(--mono); text-transform: uppercase; letter-spacing: .1em; color: var(--acid); }
+details.tool.run .tstate { color: var(--magenta); animation: pulse 1s infinite; }
+details.tool.bad { border-color: rgba(255,59,92,.5); }
+details.tool.bad .tstate { color: var(--danger); }
+.tlabel { font: .74em var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .1em; margin-top: 8px; }
+.tpre { margin: 4px 0 4px; padding: 8px 10px; background: var(--code-bg); border: 1px solid #1f1a38; font: .86em/1.5 var(--mono); color: #d6d3ee;
+  white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; }
+
+/* ------------------------------------------------------------ composer additions */
+.ctx-banner { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; padding: 6px 8px 6px 12px; border: 1px solid rgba(255,176,32,.45); background: rgba(255,176,32,.07); font-size: .86em;
+  clip-path: polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px); }
+.ctx-banner .what { color: var(--warn); font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
+.ctx-banner .btn { margin-left: auto; }
+.mic { font-size: 1.15em; padding: 4px 8px; }
+.mic.rec { color: var(--danger); text-shadow: 0 0 10px var(--danger); animation: pulse 1s infinite; }
+.mic.needs-https { opacity: .45; }
+.cont-note { font: .82em var(--mono); color: var(--acid); margin: -6px 0 14px; }
+.chip.removed { opacity: .55; border-style: dashed; }
+.chip.removed .n::after { content: " (removed)"; color: var(--muted); }
+
+/* ------------------------------------------------------------ login */
+.login-body { display: grid; place-items: center; min-height: 100dvh; padding: 20px; }
+.login-card { width: min(440px, 100%); background: rgba(17,14,31,.95); border: 1px solid var(--line-hi); padding: 28px 28px 24px; display: grid; gap: 16px; position: relative;
+  clip-path: polygon(18px 0, 100% 0, 100% calc(100% - 18px), calc(100% - 18px) 100%, 0 100%, 0 18px); box-shadow: 0 0 60px rgba(255,43,214,.08); }
+.login-card::before { content: ""; position: absolute; left: 0; top: 0; height: 2px; width: 140px; background: linear-gradient(90deg, var(--magenta), transparent); }
+.login-card h1 { font: 700 1.7em var(--ui); letter-spacing: .25em; margin: 6px 0 0; position: relative; display: inline-block; text-shadow: 0 0 18px rgba(0,240,255,.35); }
+.login-card form { display: grid; gap: 14px; }
+.login-card label { display: grid; gap: 6px; font-size: .88em; }
+.login-card input[type=password] { width: 100%; padding: 10px 12px; border: 1px solid var(--line-hi); background: var(--bg-2); outline: none; font: 1em var(--mono); color: var(--cyan); }
+.login-card input[type=password]:focus { border-color: var(--magenta); }
+.login-card .toggle { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.login-card .toggle input { accent-color: var(--magenta); }
+.login-card code, .login-pre { font-family: var(--mono); color: var(--acid); }
+.login-pre { background: var(--code-bg); border: 1px solid var(--line); padding: 10px 12px; margin: 0; }
+.login-msg { font: .84em var(--mono); min-height: 1.3em; }
+.login-msg.bad { color: var(--danger); }
+.login-msg.ok { color: var(--cyan); }
+@media (max-width: 560px) {
+  #topbar { flex-wrap: wrap; row-gap: 6px; padding: 8px 10px; }
+  .title-wrap { flex: 1 1 calc(100% - 50px); }
+  .top-right { width: 100%; justify-content: flex-end; }
+  #modelSelect { flex: 1 1 0; min-width: 0; width: 0; max-width: none; }
+  #reasoningSelect { max-width: 110px; }
+  .chip-btn .lbl { font-size: 0; }
+  .chip-btn .lbl::before { content: "⚙"; font-size: 13px; }
+}

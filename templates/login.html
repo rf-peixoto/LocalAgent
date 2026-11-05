@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#07060d">
+  <title>LOCAL//GRID · Login</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><polygon points='8,1 24,1 31,8 31,24 24,31 8,31 1,24 1,8' fill='%2307060d' stroke='%23ff2bd6' stroke-width='2'/><text x='16' y='21' font-size='13' text-anchor='middle' fill='%2300f0ff' font-family='monospace' font-weight='bold'>//</text></svg>">
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fonts.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="login-body">
+<main class="login-card" data-mode="{{ mode }}" data-min="{{ min_len }}">
+  <div class="brand">
+    <span class="sigil" aria-hidden="true">//</span>
+    <span class="brand-text">LOCAL//GRID</span>
+  </div>
+
+  {% if mode == "login" %}
+  <h1 class="glitch" data-text="AUTHENTICATE">AUTHENTICATE</h1>
+  <form id="loginForm" autocomplete="on">
+    <label>Password
+      <input id="password" type="password" autocomplete="current-password" required autofocus>
+    </label>
+    <label class="toggle"><input id="remember" type="checkbox" checked> Keep me logged in on this device (30 days)</label>
+    <button class="btn primary wide" type="submit"><span>Jack in</span></button>
+    <div id="msg" class="login-msg" role="alert"></div>
+  </form>
+
+  {% elif mode == "setup" %}
+  <h1 class="glitch" data-text="FIRST RUN">FIRST RUN</h1>
+  <p class="muted">Create the password that protects this interface. It is stored only as a hash in <code>config.json</code>.</p>
+  <form id="setupForm" autocomplete="off">
+    <label>New password <span class="muted">(at least {{ min_len }} characters)</span>
+      <input id="password" type="password" autocomplete="new-password" minlength="{{ min_len }}" required autofocus>
+    </label>
+    <label>Repeat it
+      <input id="password2" type="password" autocomplete="new-password" minlength="{{ min_len }}" required>
+    </label>
+    <button class="btn primary wide" type="submit"><span>Set password</span></button>
+    <div id="msg" class="login-msg" role="alert"></div>
+  </form>
+
+  {% else %}
+  <h1 class="glitch" data-text="LOCKED">LOCKED</h1>
+  <p>No password has been set yet.</p>
+  <p class="muted">For safety, the first password can only be created on the server machine itself. Either open
+    <code>http://localhost:&lt;port&gt;</code> there, or run:</p>
+  <pre class="login-pre">python app.py --set-password</pre>
+  {% endif %}
+</main>
+<script src="{{ url_for('static', filename='login.js') }}"></script>
+</body>
+</html>

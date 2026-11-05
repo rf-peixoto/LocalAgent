@@ -6,13 +6,11 @@
   <meta name="theme-color" content="#07060d">
   <title>LOCAL//GRID · LM Studio</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><polygon points='8,1 24,1 31,8 31,24 24,31 8,31 1,24 1,8' fill='%2307060d' stroke='%23ff2bd6' stroke-width='2'/><text x='16' y='21' font-size='13' text-anchor='middle' fill='%2300f0ff' font-family='monospace' font-weight='bold'>//</text></svg>">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Share+Tech+Mono&display=swap">
+  <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fonts.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="{{ url_for('static', filename='vendor/marked.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='vendor/purify.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='vendor/highlight.min.js') }}"></script>
 </head>
 <body>
 <div id="app">
@@ -32,6 +30,7 @@
       <button id="backupBtn" class="btn ghost small" title="Download every chat in this browser as one .json backup"><span>⇩ Backup</span></button>
       <button id="settingsBtn" class="btn ghost small" title="Settings"><span>⚙ Settings</span></button>
       <button id="helpBtn" class="btn ghost small" title="Keyboard shortcuts (Ctrl+/)"><span>?</span></button>
+      <button id="logoutBtn" class="btn ghost small" title="Log out of this device"><span>⏻</span></button>
       <input id="importInput" type="file" accept=".json,application/json" hidden>
       <div class="side-note">Chats are stored only in this browser.</div>
     </div>
@@ -47,6 +46,11 @@
       </div>
       <div class="top-right">
         <div id="ctxMeter" class="ctx" hidden><span class="ctx-text"></span><span class="ctx-bar"><span class="ctx-fill"></span></span></div>
+        <div class="menu-wrap" id="toolsWrap" hidden>
+          <button id="toolsBtn" class="chip-btn" title="Tools (MCP) the model may use in this chat"><span class="lbl">TOOLS</span> <span id="toolsCount" class="count">0</span></button>
+          <div id="toolsMenu" class="menu tools-menu" hidden></div>
+        </div>
+        <select id="reasoningSelect" title="Reasoning effort for the next message" hidden></select>
         <select id="modelSelect" title="Model used for the next message"></select>
         <span id="serverDot" class="dot" title="Checking LM Studio…"></span>
         <div class="menu-wrap">
@@ -57,6 +61,7 @@
             <button data-act="export-json">⇩ Download chat (.json)</button>
             <button data-act="export-code">⇩ Download all code (.zip)</button>
             <hr>
+            <button data-act="summarize">⤳ Summarize &amp; continue in a new chat</button>
             <button data-act="pin">⌖ Pin / unpin</button>
             <button data-act="duplicate">⎘ Duplicate chat</button>
             <button data-act="rename">✎ Rename chat</button>
@@ -84,6 +89,12 @@
     <button id="scrollDown" class="scroll-down" title="Jump to latest" hidden>↓</button>
 
     <footer id="composer">
+      <div id="ctxBanner" class="ctx-banner" hidden>
+        <span class="what">Context <span id="ctxPct">80</span>% full</span>
+        <span class="muted">— the model starts forgetting the beginning soon.</span>
+        <button id="summarizeBtn" type="button" class="btn primary small"><span>Summarize &amp; continue</span></button>
+        <button id="ctxDismiss" type="button" class="icon-btn" title="Hide">×</button>
+      </div>
       <div id="editBanner" class="edit-banner" hidden>
         <span class="what">Editing</span>
         <span class="muted">— sending replaces this message and everything after it.</span>
@@ -94,6 +105,7 @@
         <button id="attachBtn" class="icon-btn" title="Attach files (text, code, PDF, images)" aria-label="Attach files">⊕</button>
         <input id="fileInput" type="file" multiple hidden>
         <textarea id="input" rows="1" placeholder="Transmit to the model…" autocomplete="off"></textarea>
+        <button id="micBtn" class="icon-btn mic" title="Voice input (Ctrl+M)" aria-label="Voice input" hidden>🎙</button>
         <button id="sendBtn" class="btn primary send" title="Send"><span>Send</span></button>
       </div>
       <div id="statusLine" class="status-line"></div>
@@ -109,7 +121,7 @@
     <fieldset class="conn">
       <legend>Connection to LM Studio</legend>
       <label>Server URL <span class="muted">(host:port is enough)</span>
-        <input id="setUrl" type="text" spellcheck="false" autocomplete="off" placeholder="http://192.168.1.228:1234">
+        <input id="setUrl" type="text" spellcheck="false" autocomplete="off" placeholder="http://lmstudio-host:1234">
       </label>
       <label>API token <span id="tokenState" class="muted"></span>
         <span class="pw">
@@ -129,7 +141,7 @@
       <label class="grow">Persona
         <select id="setPersona"></select>
       </label>
-      <button type="button" id="savePersona" class="btn ghost small" title="Save the prompt and temperature below as a persona in this browser"><span>Save as persona…</span></button>
+      <button type="button" id="savePersona" class="btn ghost small" title="Save the prompt and temperature below — plus this chat's model, reasoning and tools — as a persona in this browser"><span>Save as persona…</span></button>
       <button type="button" id="delPersona" class="btn ghost small danger" hidden><span>Delete</span></button>
     </div>
     <label>System prompt
@@ -160,6 +172,55 @@
         <option value="xl">Extra large</option>
       </select>
     </label>
+
+    <fieldset class="conn">
+      <legend>Voice</legend>
+      <div id="voiceStatus" class="conn-result"></div>
+      <div class="row">
+        <label class="grow">Read aloud with
+          <select id="setTtsEngine">
+            <option value="kokoro">Kokoro (local, on the server)</option>
+            <option value="browser">Browser voice</option>
+          </select>
+        </label>
+        <label class="grow">Speed <span id="speedVal" class="muted">1.0×</span>
+          <input id="setTtsSpeed" type="range" min="0.6" max="1.6" step="0.05">
+        </label>
+      </div>
+      <div class="row">
+        <label class="grow">Portuguese voice <select id="setVoicePt"></select></label>
+        <label class="grow">English voice <select id="setVoiceEn"></select></label>
+        <button type="button" id="testVoice" class="btn ghost small"><span>▶ Test</span></button>
+      </div>
+      <label class="short">Voice input language
+        <select id="setSttLang">
+          <option value="">Detect automatically</option>
+          <option value="pt">Portuguese</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+    </fieldset>
+
+    <fieldset class="conn">
+      <legend>Storage in this browser</legend>
+      <div id="storageInfo" class="conn-result"></div>
+      <div class="row">
+        <button type="button" id="stripOldImages" class="btn ghost small"><span>Remove images older than 7 days</span></button>
+        <button type="button" id="stripAllImages" class="btn ghost small danger"><span>Remove all stored images</span></button>
+      </div>
+      <small class="muted">Removing images keeps the chats and file names; the pictures themselves are deleted from this browser.</small>
+    </fieldset>
+
+    <fieldset class="conn">
+      <legend>Account</legend>
+      <div class="row">
+        <label class="grow">Current password <input id="pwCurrent" type="password" autocomplete="current-password"></label>
+        <label class="grow">New password <input id="pwNew" type="password" autocomplete="new-password" minlength="8"></label>
+        <button type="button" id="changePw" class="btn ghost small"><span>Change password</span></button>
+      </div>
+      <div id="pwResult" class="conn-result"></div>
+      <small class="muted">Changing the password logs out every other device.</small>
+    </fieldset>
     <div class="dlg-actions">
       <button type="button" id="resetSettings" class="btn ghost small"><span>Reset to config.json</span></button>
       <span class="spacer"></span>
@@ -180,6 +241,7 @@
       <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>O</kbd></td><td>New chat</td></tr>
       <tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd></td><td>Search chats</td></tr>
       <tr><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd></td><td>Copy the last code block</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>M</kbd></td><td>Start / stop voice input</td></tr>
       <tr><td><kbd>Ctrl</kbd>+<kbd>/</kbd></td><td>This help</td></tr>
     </table>
     <p class="muted">Files: drop anywhere, paste screenshots, or use ⊕. Text files in Windows-1252 or UTF-16 are converted automatically.</p>

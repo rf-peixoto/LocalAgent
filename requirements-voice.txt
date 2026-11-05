@@ -1,0 +1,5 @@
+# Optional local voice features (see README "Voice").
+# Read aloud with Kokoro-82M. Portuguese also needs the espeak-ng program installed on the system.
+kokoro>=0.9.4
+# Voice input with Whisper (runs on CPU by default).
+faster-whisper>=1.1

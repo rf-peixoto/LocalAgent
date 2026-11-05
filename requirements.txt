@@ -1,3 +1,5 @@
 flask>=3.0
 requests
 pypdf>=4.0
+cheroot>=10.0
+cryptography>=42

@@ -1,108 +1,184 @@
 # LOCAL//GRID — LM Studio Web Chat
 
-A browser interface for LM Studio's native `POST /api/v1/chat` endpoint, with a neon cyberpunk look.
+A password-protected browser interface for LM Studio's native `POST /api/v1/chat` endpoint, with a neon cyberpunk look.
 
 ```
-your browser  ──►  Flask (app.py, any machine)  ──►  LM Studio (Your local IP:1234)
+your browser  ──►  LOCAL//GRID (app.py, any machine)  ──►  LM Studio (<lmstudio-host>:1234)
 ```
 
-Flask serves the page and relays each message to LM Studio, so you can chat from any device on your network. The API token stays in `config.json` on the Flask machine and is never sent to the browser.
+The Flask app serves the page and relays each message to LM Studio, so you can chat from any device on your network. The LM Studio token stays on the server and is never sent to the browser. The page loads nothing from the internet: fonts and libraries are bundled.
 
-## Run
+## Install and run
 
 ```bash
 python -m pip install -r requirements.txt
+python app.py --set-password          # once: create the login password
 python app.py
 ```
 
-Then open `http://<ip-of-the-machine-running-app.py>:5000` in any browser on your network. If the page doesn't load from another device, allow port 5000 in that machine's firewall.
+The first run creates `config.json` from `config.example.json`. Your settings, LM Studio token and password hash live in `config.json`, which `.gitignore` keeps out of version control; commit changes you want to share to `config.example.json` instead.
 
-## Connection and API token
+Open `http://<ip-of-this-machine>:5000` from any device on your network. If it doesn't load from another device, allow port 5000 in this machine's firewall.
+
+- **Password.** Instead of `--set-password`, you can open `http://localhost:5000` on this machine: it offers to create the password. Other devices see a locked screen until a password exists, so nobody else on the network can claim it.
+- **Options.** `--port 8080` uses another port, `--host 127.0.0.1` makes the page reachable only from this machine, and `--config other.json` uses another configuration file.
+- **Server.** It runs on **cheroot**, a production-grade Python server, and falls back to Flask's built-in server if cheroot isn't installed.
+
+## Login
+
+- A single password protects the whole interface, including Settings. It's stored only as a salted scrypt hash in `config.json`.
+- "Keep me logged in" lasts 30 days; otherwise the session ends when you close the browser.
+- After 5 wrong attempts, logins from that address are locked for 30 seconds, then 60, and so on, up to 15 minutes.
+- ⚙ Settings → Account changes the password and logs out every other device. ⏻ in the sidebar logs out this device.
+- Forgot the password? Run `python app.py --set-password` on the server.
+- Session cookies are `HttpOnly` and `SameSite=Strict`, and `Secure` under HTTPS. Pages are sent with a strict Content-Security-Policy.
+
+## HTTPS (needed for voice input)
+
+Browsers allow the microphone only on HTTPS pages, or on the machine itself.
+
+```bash
+python app.py --https
+```
+
+The first start creates a self-signed certificate in `certs/` for this machine's name and addresses. Each device then shows a certificate warning once; accept it to continue. If this machine's IP address changes, delete `certs/` so the certificate is regenerated.
+
+For no warnings at all, create a certificate with [mkcert](https://github.com/FiloSottile/mkcert), install its local authority on your devices, and set `"https": true`, `"ssl_cert"` and `"ssl_key"` in `config.json`.
+
+## Connection to LM Studio
 
 In ⚙ Settings → **Connection to LM Studio**:
 
-- **Server URL**: `Your local IP:1234` is enough; the `/api/v1/chat` path is added for you.
-- **API token**: the token LM Studio asks for when its "Require authentication" option is on. Leave the field blank to keep the current token, or tick **No token** if authentication is off.
-- **Test connection** checks the settings before you save them, and tells you if the server can't be reached or rejects the token.
+- **Server URL**: `lmstudio-host:1234` is enough; the `/api/v1/chat` path is added for you.
+- **API token**: the token LM Studio asks for when "Require authentication" is on. Leave the field blank to keep the current one, or tick **No token**.
+- **Test connection** checks the settings before you save them.
 
-The URL and token are saved in `config.json` on the server, so every device shares them. The token never travels back to the browser; Settings only shows its last 4 characters. The `LM_API_TOKEN` environment variable, if set, still overrides the token when the server starts.
+The URL and token are saved in `config.json` on the server. Settings only ever shows the token's last 4 characters. The `LM_API_TOKEN` environment variable, if set, overrides the token when the server starts.
 
-To use different settings, run `python app.py --config other.json --port 8080`. `--host 127.0.0.1` makes the page reachable only from the machine running it.
+## Voice (optional, fully local)
 
-## Accents and broken characters ("NÃ£o" instead of "Não")
+```bash
+python -m pip install -r requirements-voice.txt
+```
 
-**Cause.** LM Studio streams its replies as `text/event-stream` without declaring a charset. In that case Python's `requests` library assumes ISO-8859-1, so every accented character breaks before it ever reaches the screen. The terminal version, `chat.py`, has the same bug.
+**Read aloud — Kokoro-82M.**
+- Replies are spoken sentence by sentence, with the next sentence prepared while the current one plays.
+- Each sentence is detected as Portuguese or English and gets the matching voice. An English word inside a Portuguese sentence keeps a Portuguese accent.
+- Portuguese voices: `pf_dora`, `pm_alex`, `pm_santa`. English voices: `af_heart` and others.
+- Portuguese needs the **espeak-ng** program: `sudo apt install espeak-ng` on Linux, `brew install espeak-ng` on macOS, or the installer from the espeak-ng releases page on Windows.
+- It runs fine on a CPU. The first start downloads the model (about 330 MB) from Hugging Face; after that it works offline.
+- If Kokoro isn't installed, or a request fails, the browser's own voice is used instead.
 
-**Fixes in this app:**
+**Voice input — faster-whisper.**
+- The 🎙 button (or Ctrl+M) records; press it again to transcribe. The text is inserted at the cursor so you can review it before sending. Esc cancels.
+- Needs HTTPS (see above). The first start downloads the Whisper model: `small` by default, about 460 MB.
+- `medium` is more accurate for Portuguese but slower on a CPU.
 
-1. The stream is read as raw bytes and decoded as UTF-8 line by line, so text is no longer broken in transit.
-2. A repair step converts text that arrives already broken back to normal characters, for example when the model itself outputs garbled text. It handles both Latin-1 and Windows-1252 garbling, and text broken twice. It accepts a repair only when the result is a plausible character, so correct text such as "Até…”" is never altered.
-3. Chats saved by the previous version are repaired automatically the first time the page opens.
-4. Uploaded text files saved as Windows-1252 (common with Windows editors) or UTF-16 are converted to UTF-8 automatically, instead of being rejected.
+Voices, speed, test playback and the input language are in ⚙ Settings → Voice. To turn either feature off, set `"enabled": false` in the `tts` or `stt` section of `config.json`.
 
-To turn the repair off, use ⚙ Settings → "Fix broken accents", or set `"fix_encoding": false` in `config.json`.
+## Personas
 
-One case can't be fixed: if a reply already contains the `�` replacement symbol, the original bytes were thrown away before the text reached this app.
+Pick one on the new-chat screen. Each persona can set more than a prompt:
 
-## config.json
+```json
+{
+  "name": "Coder",
+  "system_prompt": "...",
+  "temperature": 0.2,
+  "model": "qwen2.5-coder-32b-instruct",
+  "reasoning": "off",
+  "tools": ["Web search"]
+}
+```
+
+- `model` is a model key exactly as LM Studio shows it; the model picker shows the keys.
+- `reasoning` is one of `off`, `low`, `medium`, `high` or `on`. It's applied only when the model supports that level.
+- `tools` lists names from `integrations`.
+
+All three are optional. ⚙ Settings → "Save as persona…" also stores the current chat's model, reasoning and tools, in this browser only.
+
+## Reasoning control
+
+For models that report reasoning options (such as Qwen3), a 🧠 picker appears next to the model. **Auto** uses the model's own default. **Off** skips the thinking phase for quick answers, and higher levels think longer. The choice is saved per chat.
+
+## Tools (MCP)
+
+LM Studio can let the model call tools from MCP servers. Declare the ones you want in `config.json`:
+
+```json
+"integrations": [
+  { "name": "Browser", "id": "mcp/playwright", "description": "From LM Studio's mcp.json" },
+  { "name": "Hugging Face", "server_url": "https://huggingface.co/mcp", "server_label": "huggingface",
+    "allowed_tools": ["model_search"], "headers": { "Authorization": "Bearer ..." }, "default": false }
+]
+```
+
+- **`id`** refers to a server already configured in LM Studio's `mcp.json`. LM Studio needs **Server settings → "Allow calling servers from mcp.json"**.
+- **`server_url`** defines the server per request. LM Studio needs **"Allow per-request MCPs"**. `headers` stay on the server and are never sent to the browser.
+- **Choosing tools.** Pick a chat's tools from the **TOOLS** menu in the header. `"default": true` turns a tool on for new chats.
+- **In the chat.** Each tool call appears in the reply with its arguments and output.
+
+## Long chats: Summarize & continue
+
+When the **CTX** meter passes 75%, a banner offers **Summarize & continue**; it's also always in the ⋮ menu.
+
+- The model writes a compact summary of the chat. That request isn't stored as part of the old chat.
+- A new chat opens with the same persona, model, reasoning and tools, with the summary attached to your first message.
+
+## Accents and broken characters
+
+LM Studio streams replies without declaring a charset. The app always decodes them as UTF-8, and repairs text that arrives already broken ("NÃ£o" → "Não"). Uploaded text files in Windows-1252 or UTF-16 are converted automatically. To turn the repair off, use ⚙ Settings → "Fix broken accents" or set `"fix_encoding": false`.
+
+## Everything else
+
+- **Chatting.**
+  - Regenerate, edit and resend earlier messages (or press <kbd>↑</kbd> in the empty box to edit the last one), and Continue.
+  - Stop with Esc.
+  - Read aloud.
+  - A live phase, timer and speed while generating.
+- **Code.** Blocks are syntax-colored, with Wrap, Copy and Download buttons and a renameable file name. Each answer's code downloads as a .zip, and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> copies the last block.
+- **Files.** Attach with ⊕, by dropping or by pasting:
+  - text and source files
+  - PNG, JPEG, WEBP and GIF images (the model must support vision)
+  - PDFs (the text is extracted)
+- **Chats.**
+  - Stored only in each browser, with a draft kept per chat.
+  - Pin, search (<kbd>Ctrl</kbd>+<kbd>K</kbd>), rename, duplicate, delete.
+  - Export as .md or .json; ⇩ Backup and ⇪ Import move chats between machines.
+- **Storage.** ⚙ Settings → Storage shows how much space chats use and removes stored images: those older than 7 days, or all of them. The chats themselves are kept.
+- **Look.** Four text sizes, and a "Visual effects" switch for the scanlines and glitch. <kbd>Ctrl</kbd>+<kbd>/</kbd> lists all shortcuts.
+
+## config.json reference
 
 | Key | Meaning |
 |---|---|
-| `url` | LM Studio chat endpoint. The model list is read from the same server's `/api/v1/models`. |
-| `model` | Default model. You can switch models per chat from the dropdown at the top. |
-| `token` | LM Studio API token; `""` means no token. Easier to set in ⚙ Settings. `LM_API_TOKEN` overrides it. |
-| `system_prompt` | System prompt of the built-in "Default" persona. |
-| `personas` | Extra presets, each with `name`, `system_prompt` and optional `temperature`. They appear as buttons on the new-chat screen. Edits take effect for new chats after the server restarts and the page reloads. |
-| `temperature` | `null` uses the model's default. Otherwise a number from 0 to 1. |
-| `max_output_tokens` | `null` means no limit. |
-| `connect_timeout` / `response_timeout` | Same as the terminal version. `null` disables the idle timeout. |
-| `max_file_bytes` | Size limit for a text file, and for the text extracted from a PDF. |
-| `max_image_bytes` / `max_pdf_bytes` | Upload limits for images and PDFs. |
+| `url`, `token` | LM Studio endpoint and API token. Easier to set in ⚙ Settings. |
+| `model` | Default model. |
+| `system_prompt` | Prompt of the built-in "Default" persona. |
+| `personas` | Presets; see above. |
+| `integrations` | MCP tools; see above. |
+| `temperature`, `max_output_tokens` | `null` means the model's default and no limit. |
+| `connect_timeout`, `response_timeout` | Seconds; `null` disables the idle timeout. |
+| `max_file_bytes`, `max_image_bytes`, `max_pdf_bytes`, `max_audio_bytes` | Upload limits. |
 | `markdown`, `show_stats`, `show_reasoning`, `fix_encoding` | Defaults for the toggles in ⚙ Settings. |
-| `host`, `port` | Where Flask listens. `0.0.0.0` means the whole network. |
-
-## Features
-
-**Chatting**
-- Personas: pick one on the new-chat screen. They come from `config.json`: Default, Coder, Threat Intel, Red Team, Blue Team / DFIR, Reverse Engineer, Data Analyst and Report Writer. You can also save your own in ⚙ Settings → "Save as persona…"; those are stored in this browser.
-- Settings can be changed while a reply is generating. A new system prompt then applies from your next new chat.
-- **↻ Regenerate** asks for a new answer to your last message.
-- **Edit** (or <kbd>↑</kbd> in the empty input box) rewrites an earlier message. Sending replaces that message and everything after it. LM Studio continues from the matching point in the conversation, so no context is wasted.
-- **Continue** asks the model to keep going when an answer stops early.
-- **Read aloud** reads an answer with the browser's built-in text-to-speech; code blocks are skipped.
-- **Stop** with the Stop button or Esc. A stopped or failed reply isn't saved and doesn't advance the conversation. Your message and files go back into the input box, and nothing is retried automatically.
-- While a reply is generating, you see its phase (loading the model, reading the prompt, thinking, writing), the elapsed time and an estimated speed.
-- The **CTX** meter in the header shows how much of the model's context window the chat uses. It turns amber, then red, as it fills up; that's the moment to start a new chat.
-- If the reply finishes while the tab is in the background, the tab title shows "● Reply ready".
-
-**Code**
-- Code blocks are syntax-colored. Each has buttons to **Wrap** long lines, **Copy**, and **Download**. Click the file name in the block's header to rename it before downloading.
-- <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> copies the last code block.
-- Each answer can download its code files as a .zip. The ⋮ menu downloads all the code in a chat.
-
-**Files**
-- Attach with ⊕, by dropping files anywhere on the page, or by pasting (for example, a screenshot).
-- Supported: text and source files (UTF-8, Windows-1252 or UTF-16); PNG, JPEG, WEBP and GIF images (the model must support vision; the chip turns amber if the selected model doesn't report it); and PDFs (the text is extracted page by page).
-- Click an attachment chip in an old message to download it again.
-
-**Chats**
-- History is saved in the browser's own storage, so each machine sees only its own chats. Unsent text is kept per chat as a draft.
-- Pin chats to the top, search all chats with <kbd>Ctrl</kbd>+<kbd>K</kbd>, and use the ⋮ menu to rename, duplicate or delete a chat.
-- Export a chat as .md or .json, or copy it as Markdown.
-- **⇩ Backup** downloads every chat in one file. **⇪ Import** accepts a single chat or a whole backup; use the pair to move chats to another machine.
-
-**Look**
-- Text size has four steps in ⚙ Settings. "Visual effects" switches off the scanlines, glow and glitch animation.
-- Animations are also off automatically if the system is set to reduce motion.
-- <kbd>Ctrl</kbd>+<kbd>/</kbd> lists all keyboard shortcuts.
+| `tts` | `enabled`, `voice_pt`, `voice_en`, `speed`, `device` (`null` picks automatically). |
+| `stt` | `enabled`, `model` (`tiny` … `large-v3`), `device` (`cpu`/`cuda`), `compute_type`, `language` (`null` = detect). |
+| `password_hash` | Set by `--set-password`; don't edit by hand. |
+| `host`, `port`, `https`, `ssl_cert`, `ssl_key` | Where and how the server listens. |
 
 ## When LM Studio restarts
 
-LM Studio keeps each conversation's context on its side. A saved chat continues by sending LM Studio the ID of the last reply (`previous_response_id`). After LM Studio restarts it may no longer recognize that ID. When that happens, the chat shows a **Resend with saved history** button. It starts a new LM Studio session with the saved transcript (including text and PDF attachments; images are left out) followed by your message.
+LM Studio keeps each conversation's context on its side, and a saved chat continues from the ID of its last reply. After a restart, LM Studio may no longer recognize that ID. The chat then shows **Resend with saved history**, which starts a new session from the saved transcript; image attachments are left out.
 
-## Notes
+## Files
 
-- Copy works over plain `http://` on your network through a fallback, because browsers only allow the modern clipboard API on HTTPS or localhost.
-- The page loads its fonts and three small libraries from public CDNs: marked, DOMPurify and highlight.js. The browser therefore needs internet access, but the model traffic stays on your network.
-- Model output is sanitized before display, and downloaded code is never executed.
-- This is Flask's built-in server, which is fine for one user on a home network. Don't expose it to the internet; there is no login.
+| Path | Purpose |
+|---|---|
+| `app.py` | Server: configuration, relay to LM Studio, uploads, voice endpoints |
+| `auth.py` | Login, sessions, rate limiting |
+| `voice.py` | Kokoro TTS and faster-whisper STT (optional) |
+| `certs.py` | Self-signed certificate for `--https` |
+| `textfix.py` | UTF-8 repair and text-file decoding |
+| `static/`, `templates/` | The web interface; `static/vendor/` holds the bundled libraries and fonts, with their licenses |
+| `config.example.json` | Template for `config.json` (copied on first run) |
+| `config.json`, `.secret_key`, `certs/` | Created at runtime. They hold secrets and are git-ignored. |
